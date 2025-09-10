@@ -40,6 +40,11 @@ struct QuadratureData
    // It must be recomputed in every time step.
    DenseTensor stressJinvT;
 
+   // Pressure contribuation to total stress tensor
+   DenseTensor pressureJinvT; 
+   // Stress tensor contribuation to total stress
+   DenseTensor viscousJinvT;
+
    // Quadrature data used for full/partial assembly of the mass matrices.
    // At time zero, we compute and store (rho0 * det(J0) * qp_weight) at each
    // quadrature point. Note the at any other time, we can compute
@@ -58,6 +63,8 @@ struct QuadratureData
    QuadratureData(int dim, int NE, int quads_per_el)
       : Jac0inv(dim, dim, NE * quads_per_el),
         stressJinvT(NE * quads_per_el, dim, dim),
+        pressureJinvT(NE * quads_per_el, dim, dim),
+        viscousJinvT(NE * quads_per_el, dim, dim),
         rho0DetJ0w(NE * quads_per_el) { }
 };
 

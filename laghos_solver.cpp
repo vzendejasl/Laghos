@@ -136,6 +136,7 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
                    (oq > 0) ? oq : 3 * H1.GetOrder(0) + L2.GetOrder(0) - 1)),
    Q1D(int(floor(0.7 + pow(ir.GetNPoints(), 1.0 / dim)))),
    qdata(dim, NE, ir.GetNPoints()),
+
    qdata_is_current(false),
    forcemat_is_assembled(false),
    Force(&L2, &H1),
@@ -153,6 +154,27 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    rhs_c_gf(&H1c),
    dvc_gf(&H1c)
 {
+
+   // Initialize new pressure and viscous tensors to zero for now
+   const int NQ = ir.GetNPoints();
+   for (int i = 0; i < NE * NQ; i++) {
+      for (int d1 = 0; d1 < dim; d1++) {
+         for (int d2 = 0; d2 < dim; d2++) {
+            qdata.pressureJinvT(i, d1, d2) = 0.0;
+            qdata.viscousJinvT(i, d1, d2) = 0.0;
+         }
+      }
+   }
+
+if (Mpi::Root()) {
+   std::cout << "Sanity Check 1: QuadratureData structure" << std::endl;
+   std::cout << "  stressJinvT size: " << qdata.stressJinvT.TotalSize() << std::endl;
+   std::cout << "  pressureJinvT size: " << qdata.pressureJinvT.TotalSize() << std::endl;
+   std::cout << "  viscousJinvT size: " << qdata.viscousJinvT.TotalSize() << std::endl;
+   std::cout << "  Expected size: " << NE * ir.GetNPoints() * dim * dim << std::endl;
+}
+
+
    block_offsets[0] = 0;
    block_offsets[1] = block_offsets[0] + H1Vsize;
    block_offsets[2] = block_offsets[1] + H1Vsize;
@@ -1012,6 +1034,8 @@ void QUpdateBody(const int NE, const int e,
                  double* __restrict__ Jpi,
                  double* __restrict__ ph_dir,
                  double* __restrict__ stressJiT,
+                 double* __restrict__ pressureJiT,
+                 double* __restrict__ viscousJiT,
                  const double* __restrict__ d_gamma,
                  const double* __restrict__ d_weights,
                  const double* __restrict__ d_Jacobians,
@@ -1020,7 +1044,9 @@ void QUpdateBody(const int NE, const int e,
                  const double* __restrict__ d_grad_v_ext,
                  const double* __restrict__ d_Jac0inv,
                  double *d_dt_est,
-                 double *d_stressJinvT)
+                 double *d_stressJinvT,
+                 double *d_pressureJinvT,
+                 double *d_viscousJinvT)
 {
    constexpr int DIM2 = DIM*DIM;
    double min_detJ = infinity;
@@ -1037,8 +1063,16 @@ void QUpdateBody(const int NE, const int e,
    const double E = fmax(0.0, d_e_quads[eq]);
    const double P = (gamma - 1.0) * R * E;
    const double S = sqrt(gamma * (gamma - 1.0) * E);
-   for (int k = 0; k < DIM2; k++) { stress[k] = 0.0; }
-   for (int d = 0; d < DIM; d++) { stress[d*DIM+d] = -P; }
+
+   double pressure_stress[DIM2];
+   double viscous_stress[DIM2];
+   for (int k = 0; k < DIM2; k++)
+   { 
+      pressure_stress[k] = 0.0;
+      viscous_stress[k] = 0.0;
+      stress[k] = 0.0; 
+   }
+   for (int d = 0; d < DIM; d++) { pressure_stress[d*DIM+d] = -P; }
    double visc_coeff = 0.0;
    if (use_viscosity)
    {
@@ -1085,7 +1119,12 @@ void QUpdateBody(const int NE, const int e,
       const double eps = 1e-12;
       visc_coeff += 0.5 * R * H  * S * vorticity_coeff *
                     (1.0 - smooth_step_01(mu-2.0*eps, eps));
-      kernels::Add(DIM, DIM, visc_coeff, stress, sgrad_v, stress);
+      // kernels::Add(DIM, DIM, visc_coeff, stress, sgrad_v, stress);
+      kernels::Add(DIM, DIM, visc_coeff, viscous_stress, sgrad_v, viscous_stress);
+
+      for (int k = 0; k < DIM2; k++){
+         stress[k] = pressure_stress[k] + viscous_stress[k];
+      }
    }
    // Time step estimate at the point. Here the more relevant length
    // scale is related to the actual mesh deformation; we use the min
@@ -1110,14 +1149,23 @@ void QUpdateBody(const int NE, const int e,
       }
    }
    // Quadrature data for partial assembly of the force operator.
+   kernels::MultABt(DIM, DIM, DIM, pressure_stress, Jinv, pressureJiT);
+   kernels::MultABt(DIM, DIM, DIM, viscous_stress, Jinv, viscousJiT);
    kernels::MultABt(DIM, DIM, DIM, stress, Jinv, stressJiT);
-   for (int k = 0; k < DIM2; k++) { stressJiT[k] *= weight * detJ; }
+   for (int k = 0; k < DIM2; k++) 
+   { 
+      pressureJiT[k] *= weight * detJ; 
+      viscousJiT[k] *= weight * detJ; 
+      stressJiT[k] *= weight * detJ; 
+   }
    for (int vd = 0 ; vd < DIM; vd++)
    {
       for (int gd = 0; gd < DIM; gd++)
       {
          const int offset = eq + NQ*NE*(gd + vd*DIM);
          d_stressJinvT[offset] = stressJiT[vd + gd*DIM];
+         // d_pressureJinvT[offset] = pressureJiT[vd + gd*DIM];
+         // d_viscousJinvT[offset] = viscousJiT[vd + gd*DIM];
       }
    }
 }
@@ -1231,7 +1279,9 @@ void QKernel(const int NE, const int NQ,
              const Vector &grad_v_ext,
              const DenseTensor &Jac0inv,
              Vector &dt_est,
-             DenseTensor &stressJinvT)
+             DenseTensor &stressJinvT,
+             DenseTensor &pressureJinvT,
+             DenseTensor &viscousJinvT)
 {
    constexpr int DIM2 = DIM*DIM;
    const auto d_gamma = gamma_gf.Read();
@@ -1243,6 +1293,9 @@ void QKernel(const int NE, const int NQ,
    const auto d_Jac0inv = Read(Jac0inv.GetMemory(), Jac0inv.TotalSize());
    auto d_dt_est = dt_est.ReadWrite();
    auto d_stressJinvT = Write(stressJinvT.GetMemory(), stressJinvT.TotalSize());
+   auto d_pressureJinvT = Write(pressureJinvT.GetMemory(), pressureJinvT.TotalSize());
+   auto d_viscousJinvT = Write(viscousJinvT.GetMemory(), viscousJinvT.TotalSize());
+
    if (DIM == 2)
    {
       MFEM_FORALL_2D(e, NE, Q1D, Q1D, 1,
@@ -1256,6 +1309,9 @@ void QKernel(const int NE, const int NQ,
          double Jpi[DIM2];
          double ph_dir[DIM];
          double stressJiT[DIM2];
+
+         double pressureJiT[DIM2];
+         double viscousJiT[DIM2];
          MFEM_FOREACH_THREAD(qx,x,Q1D)
          {
             MFEM_FOREACH_THREAD(qy,y,Q1D)
@@ -1263,10 +1319,14 @@ void QKernel(const int NE, const int NQ,
                QUpdateBody<DIM>(NE, e, NQ, qx + qy * Q1D,
                                 use_viscosity, use_vorticity, h0, h1order, cfl, infinity,
                                 Jinv, stress, sgrad_v, eig_val_data, eig_vec_data,
-                                compr_dir, Jpi, ph_dir, stressJiT,
+                                compr_dir, Jpi, ph_dir,
+                                stressJiT,
+                                pressureJiT,
+                                viscousJiT,
                                 d_gamma, d_weights, d_Jacobians, d_rho0DetJ0w,
                                 d_e_quads, d_grad_v_ext, d_Jac0inv,
-                                d_dt_est, d_stressJinvT);
+                                d_dt_est, d_stressJinvT,
+                                d_pressureJinvT, d_viscousJinvT);
             }
          }
          MFEM_SYNC_THREAD;
@@ -1285,6 +1345,10 @@ void QKernel(const int NE, const int NQ,
          double Jpi[DIM2];
          double ph_dir[DIM];
          double stressJiT[DIM2];
+
+         double pressureJiT[DIM2];
+         double viscousJiT[DIM2];
+
          MFEM_FOREACH_THREAD(qx,x,Q1D)
          {
             MFEM_FOREACH_THREAD(qy,y,Q1D)
@@ -1294,10 +1358,14 @@ void QKernel(const int NE, const int NQ,
                   QUpdateBody<DIM>(NE, e, NQ, qx + Q1D * (qy + qz * Q1D),
                                    use_viscosity, use_vorticity, h0, h1order, cfl, infinity,
                                    Jinv, stress, sgrad_v, eig_val_data, eig_vec_data,
-                                   compr_dir, Jpi, ph_dir, stressJiT,
+                                   compr_dir, Jpi, ph_dir,
+                                   stressJiT,
+                                   pressureJiT,
+                                   viscousJiT,
                                    d_gamma, d_weights, d_Jacobians, d_rho0DetJ0w,
                                    d_e_quads, d_grad_v_ext, d_Jac0inv,
-                                   d_dt_est, d_stressJinvT);
+                                   d_dt_est, d_stressJinvT,
+                                   d_pressureJinvT, d_viscousJinvT);
                }
             }
          }
@@ -1337,7 +1405,10 @@ void QUpdate::UpdateQuadratureData(const Vector &S, QuadratureData &qdata)
                             const Vector &Jacobians, const Vector &rho0DetJ0w,
                             const Vector &e_quads, const Vector &grad_v_ext,
                             const DenseTensor &Jac0inv,
-                            Vector &dt_est, DenseTensor &stressJinvT);
+                            Vector &dt_est, 
+                            DenseTensor &stressJinvT,
+                            DenseTensor &pressureJinvT,
+                            DenseTensor &viscousJinvT);
    static std::unordered_map<int, fQKernel> qupdate =
    {
       // 2D.
@@ -1355,7 +1426,8 @@ void QUpdate::UpdateQuadratureData(const Vector &S, QuadratureData &qdata)
    qupdate[id](NE, NQ, use_viscosity, use_vorticity, qdata.h0, h1order,
                cfl, infinity, gamma_gf, ir.GetWeights(), q_dx,
                qdata.rho0DetJ0w, q_e, q_dv,
-               qdata.Jac0inv, q_dt_est, qdata.stressJinvT);
+               qdata.Jac0inv, q_dt_est,
+               qdata.stressJinvT, qdata.pressureJinvT, qdata.stressJinvT);
    qdata.dt_est = q_dt_est.Min();
    LAGHOS_DEVICE_SYNC;
    timer->sw_qdata.Stop();

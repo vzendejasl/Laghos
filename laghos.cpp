@@ -641,6 +641,8 @@ int main(int argc, char *argv[])
    BlockVector S_old(S);
    long mem=0, mmax=0, msum=0;
    int checks = 0;
+
+
    //   const double internal_energy = hydro.InternalEnergy(e_gf);
    //   const double kinetic_energy = hydro.KineticEnergy(v_gf);
    //   if (mpi.Root())
@@ -719,8 +721,8 @@ int main(int argc, char *argv[])
             MPI_Reduce(&mem, &mmax, 1, MPI_LONG, MPI_MAX, 0, pmesh->GetComm());
             MPI_Reduce(&mem, &msum, 1, MPI_LONG, MPI_SUM, 0, pmesh->GetComm());
          }
-         // const double internal_energy = hydro.InternalEnergy(e_gf);
-         // const double kinetic_energy = hydro.KineticEnergy(v_gf);
+         const double internal_energy = hydro.InternalEnergy(e_gf);
+         const double kinetic_energy = hydro.KineticEnergy(v_gf);
          if (Mpi::Root())
          {
             const double sqrt_norm = sqrt(norm);
@@ -730,13 +732,13 @@ int main(int argc, char *argv[])
                  << ",\tt = " << std::setw(5) << std::setprecision(4) << t
                  << ",\tdt = " << std::setw(5) << std::setprecision(6) << dt
                  << ",\t|e| = " << std::setprecision(10) << std::scientific
-                 << sqrt_norm;
-            //  << ",\t|IE| = " << std::setprecision(10) << std::scientific
-            //  << internal_energy
-            //   << ",\t|KE| = " << std::setprecision(10) << std::scientific
-            //  << kinetic_energy
-            //   << ",\t|E| = " << std::setprecision(10) << std::scientific
-            //  << kinetic_energy+internal_energy;
+                 << sqrt_norm
+            << ",\t|IE| = " << std::setprecision(10) << std::scientific
+            << internal_energy
+             << ",\t|KE| = " << std::setprecision(10) << std::scientific
+            << kinetic_energy
+             << ",\t|E| = " << std::setprecision(10) << std::scientific
+            << kinetic_energy+internal_energy;
             cout << std::fixed;
             if (mem_usage)
             {
@@ -941,12 +943,12 @@ void v0(const Vector &x, Vector &v)
    switch (problem)
    {
       case 0:
-         v(0) =  sin(M_PI*x(0)) * cos(M_PI*x(1));
-         v(1) = -cos(M_PI*x(0)) * sin(M_PI*x(1));
+         v(0) =  sin(2.0*M_PI*x(0)) * cos(2.0*M_PI*x(1));
+         v(1) = -cos(2.0*M_PI*x(0)) * sin(2.0*M_PI*x(1));
          if (x.Size() == 3)
          {
-            v(0) *= cos(M_PI*x(2));
-            v(1) *= cos(M_PI*x(2));
+            v(0) *= cos(2.0*M_PI*x(2));
+            v(1) *= cos(2.0*M_PI*x(2));
             v(2) = 0.0;
          }
          break;
