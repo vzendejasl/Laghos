@@ -132,6 +132,10 @@ protected:
    mutable MixedBilinearForm Force;
    // Same as above, but done through partial assembly.
    ForcePAOperator *ForcePA;
+
+   ForcePAOperator *ForcePA_pressure;
+   ForcePAOperator *ForcePA_viscous;
+
    // Mass matrices done through partial assembly:
    // velocity (coupled H1 assembly) and energy (local L2 assemblies).
    MassPAOperator *VMassPA, *EMassPA;
@@ -141,6 +145,7 @@ protected:
    mutable TimingData timer;
    mutable QUpdate qupdate;
    mutable Vector X, B, one, rhs, e_rhs;
+   mutable Vector e_rhs_p, e_rhs_tau;
    mutable GridFunction rhs_c_gf, dvc_gf;
    mutable Array<int> c_tdofs[3];
 

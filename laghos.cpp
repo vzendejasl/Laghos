@@ -807,6 +807,25 @@ int main(int argc, char *argv[])
             e_gf.SaveAsOne(e_ofs);
             e_ofs.close();
          }
+
+            
+   
+         Vector &v_current = S.GetBlock(1); // velocity is block 1
+         // Compute work contributions over this timestep
+         const double total_work = hydro.ComputeTotalWork(v_gf, dt);
+         const double pressure_work = hydro.ComputePressureWork(v_gf, dt);
+         const double viscous_work = hydro.ComputeViscousWork(v_gf, dt);
+   
+         if (Mpi::Root())
+         {
+            cout << "[work] dt=" << std::scientific << std::setprecision(6) << dt 
+                 << ", total=" << total_work
+                 << ", pressure=" << pressure_work 
+                 << ", viscous=" << viscous_work
+                 << ", sum=" << (pressure_work + viscous_work)
+                 << ", verification=" << (total_work - (pressure_work + viscous_work))
+                 << endl;
+         }
       }
 
       // Problems checks

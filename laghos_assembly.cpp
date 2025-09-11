@@ -123,7 +123,8 @@ void MassPAOperator::Mult(const Vector &x, Vector &y) const
 ForcePAOperator::ForcePAOperator(const QuadratureData &qdata,
                                  ParFiniteElementSpace &h1,
                                  ParFiniteElementSpace &l2,
-                                 const IntegrationRule &ir) :
+                                 const IntegrationRule &ir,
+                                 const DenseTensor *selector) :
    Operator(),
    dim(h1.GetMesh()->Dimension()),
    NE(h1.GetMesh()->GetNE()),
@@ -140,6 +141,7 @@ ForcePAOperator::ForcePAOperator(const QuadratureData &qdata,
    L2sz(L2.GetFE(0)->GetDof() * NE),
    L2D2Q(&L2.GetFE(0)->GetDofToQuad(ir, DofToQuad::TENSOR)),
    H1D2Q(&H1.GetFE(0)->GetDofToQuad(ir, DofToQuad::TENSOR)),
+   SJiT(selector ? selector : &qdata.stressJinvT),
    X(L2sz), Y(H1sz) { }
 
 template<int DIM, int D1D, int Q1D, int L1D, int NBZ = 1> static
@@ -291,6 +293,11 @@ void ForceMult2D(const int NE,
          MFEM_SYNC_THREAD;
       }
    });
+
+   MFEM_ASSERT(SJiT != nullptr, "ForcePAOperator SJiT must not be null");
+   MFEM_ASSERT(SJiT->TotalSize() == qdata.stressJinvT.TotalSize(),
+               "Selected tensor has unexpected size");
+
 }
 
 template<int DIM, int D1D, int Q1D, int L1D> static
@@ -557,9 +564,16 @@ void ForcePAOperator::Mult(const Vector &x, Vector &y) const
 {
    if (L2R) { L2R->Mult(x, X); }
    else { X = x; }
+
+   const DenseTensor &S = *SJiT;
+   // Cheap guard; compiled out in Release
+   MFEM_ASSERT(S.TotalSize() == qdata.stressJinvT.TotalSize(),
+               "Selected tensor has unexpected size");
+
    ForceMult(dim, D1D, Q1D, L1D, D1D, NE,
              L2D2Q->B, H1D2Q->Bt, H1D2Q->Gt,
-             qdata.stressJinvT, X, Y);
+             S, 
+             X, Y);
    H1R->MultTranspose(Y, y);
 }
 
@@ -960,15 +974,39 @@ static void ForceMultTranspose(const int DIM, const int D1D, const int Q1D,
    call[id](NE, L2Bt, H1B, H1G, stressJinvT, v, e);
 }
 
+// void ForcePAOperator::MultTranspose(const Vector &x, Vector &y) const
+// {
+//    H1R->Mult(x, Y);
+//    ForceMultTranspose(dim, D1D, Q1D, L1D, NE,
+//                       L2D2Q->Bt, H1D2Q->B, H1D2Q->G,
+//                       qdata.stressJinvT, Y, X);
+//    if (L2R) { L2R->MultTranspose(X, y); }
+//    else { y = X; }
+// }
+
 void ForcePAOperator::MultTranspose(const Vector &x, Vector &y) const
 {
+   // H1 -> quadrature space application (same as before)
    H1R->Mult(x, Y);
+
+   // Use the selected tensor (defaults to total stress when selector==nullptr)
+   const DenseTensor &S = *SJiT;
+
+   // Cheap debug guard (compiled out in Release)
+   MFEM_ASSERT(S.TotalSize() == qdata.stressJinvT.TotalSize(),
+               "Selected tensor has unexpected size");
+
+   // Apply the PA kernel with the selected tensor
    ForceMultTranspose(dim, D1D, Q1D, L1D, NE,
                       L2D2Q->Bt, H1D2Q->B, H1D2Q->G,
-                      qdata.stressJinvT, Y, X);
+                      S,           
+                      Y, X);
+
+   // Back to L2
    if (L2R) { L2R->MultTranspose(X, y); }
-   else { y = X; }
+   else     { y = X; }
 }
+
 
 } // namespace hydrodynamics
 

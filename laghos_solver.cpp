@@ -141,6 +141,7 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    forcemat_is_assembled(false),
    Force(&L2, &H1),
    ForcePA(nullptr), VMassPA(nullptr), EMassPA(nullptr),
+   ForcePA_pressure(nullptr), ForcePA_viscous(nullptr),
    VMassPA_Jprec(nullptr),
    CG_VMass(H1.GetParMesh()->GetComm()),
    CG_EMass(L2.GetParMesh()->GetComm()),
@@ -151,6 +152,8 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    one(L2Vsize),
    rhs(H1Vsize),
    e_rhs(L2Vsize),
+   e_rhs_p(L2Vsize),
+   e_rhs_tau(L2Vsize),
    rhs_c_gf(&H1c),
    dvc_gf(&H1c)
 {
@@ -187,6 +190,44 @@ if (Mpi::Root()) {
       qupdate = new QUpdate(dim, NE, Q1D, visc, vort, cfl,
                             &timer, gamma_gf, ir, H1, L2);
       ForcePA = new ForcePAOperator(qdata, H1, L2, ir);
+      ForcePA_pressure = new ForcePAOperator(qdata, H1, L2, ir, &qdata.pressureJinvT);
+      ForcePA_viscous  = new ForcePAOperator(qdata, H1, L2, ir, &qdata.viscousJinvT);
+
+    #if 1  // set to 0 to disable
+    if (Mpi::Root()) { std::cout << "[sanity] Checking ForcePA selector consistency...\n"; }
+    
+    {
+       // Build a reference operator that explicitly uses total stress
+       ForcePAOperator ForcePA_explicit(qdata, H1, L2, ir, &qdata.stressJinvT);
+    
+       // Make a tiny test velocity (H1-sized). Use unit or random; unit is fine.
+       Vector vtest(H1Vsize), y_def(L2Vsize), y_ref(L2Vsize);
+       vtest = 0.0;
+       // put a few non-zeros to exercise kernels deterministically
+       const int stride = std::max(1, H1Vsize / 7);
+       for (int i = 0; i < H1Vsize; i += stride) { vtest[i] = 1.0; }
+    
+       // Apply both operators: y = (ForcePA)^T v
+       y_def  = 0.0; y_ref = 0.0;
+       ForcePA->MultTranspose(vtest, y_def);
+       ForcePA_explicit.MultTranspose(vtest, y_ref);
+    
+       // Compare
+       Vector diff(y_def); diff.Add(-1.0, y_ref);
+       const double rel = (y_ref.Norml2() > 0.0) ? diff.Norml2() / y_ref.Norml2()
+                                                 : diff.Norml2();
+    
+       if (Mpi::Root())
+       {
+          std::cout.setf(std::ios::scientific); std::cout.precision(6);
+          std::cout << "[sanity] ||(F_def^T - F_exp^T) v|| / ||F_exp^T v|| = "
+                    << rel << std::endl;
+       }
+    }
+    #endif
+
+
+
       VMassPA = new MassPAOperator(H1c, ir, rho0_coeff);
       EMassPA = new MassPAOperator(L2, ir, rho0_coeff);
       // Inside the above constructors for mass, there is reordering of the mesh
@@ -314,6 +355,8 @@ LagrangianHydroOperator::~LagrangianHydroOperator()
       delete VMassPA;
       delete VMassPA_Jprec;
       delete ForcePA;
+      delete ForcePA_pressure;
+      delete ForcePA_viscous;
    }
 }
 
@@ -474,9 +517,11 @@ void LagrangianHydroOperator::SolveEnergy(const Vector &S, const Vector &v,
       LAGHOS_DEVICE_SYNC;
       timer.sw_force.Start();
       ForcePA->MultTranspose(v, e_rhs);
+      
       LAGHOS_DEVICE_SYNC;
       timer.sw_force.Stop();
       if (e_source) { e_rhs += *e_source; }
+
       LAGHOS_DEVICE_SYNC;
       timer.sw_cgL2.Start();
       CG_EMass.Mult(e_rhs, de);
@@ -487,6 +532,55 @@ void LagrangianHydroOperator::SolveEnergy(const Vector &S, const Vector &v,
       // Move the memory location of the subvector 'de' to the memory
       // location of the base vector 'dS_dt'.
       de.GetMemory().SyncAlias(dS_dt.GetMemory(), de.Size());
+
+      // --- per-source RHS already available? if not, compute it now
+      // (if you did the RHS split earlier in this function, reuse those vectors)
+      e_rhs_p = 0.0;
+      e_rhs_tau = 0.0;
+      ForcePA_pressure->MultTranspose(v, e_rhs_p);
+      ForcePA_viscous->MultTranspose(v, e_rhs_tau);
+      if (e_source) { /* source belongs to 'total' only; keep split pure */ }
+      
+      // Sanity A (RHS): total ≈ pressure + viscous
+      Vector rhs_sum(e_rhs_p); rhs_sum.Add(1.0, e_rhs_tau);
+      Vector rhs_res(e_rhs);   rhs_res.Add(-1.0, rhs_sum);
+      const double rhs_rel =
+         (rhs_sum.Norml2() > 0.0) ? rhs_res.Norml2()/rhs_sum.Norml2()
+                                  : rhs_res.Norml2();
+      
+      // Solve per-source energy increments: M_e * de_* = e_rhs_*
+      Vector de_p(L2Vsize), de_tau(L2Vsize);
+      CG_EMass.Mult(e_rhs_p,  de_p);
+      CG_EMass.Mult(e_rhs_tau, de_tau);
+      
+      // Sanity B (field level): de_total ≈ de_p + de_tau
+      Vector de_sum(de_p); de_sum.Add(1.0, de_tau);
+      Vector de_res(de_sum); de_res.Add(-1.0, de);
+      const double de_rel =
+         (de.Norml2() > 0.0) ? de_res.Norml2()/de.Norml2()
+                             : de_res.Norml2();
+      
+      // Integrate to "power" diagnostics
+      const double Pp   = IntegrateL2Field(de_p);
+      const double Ptau = IntegrateL2Field(de_tau);
+      const double total_rhs_power = IntegrateL2Field(de);
+      
+      // // Print (use scientific to avoid hex-float surprises)
+      // if (Mpi::Root())
+      // {
+      //    std::cout.setf(std::ios::scientific, std::ios::floatfield);
+      //    std::cout.precision(6);
+      //    std::cout << "[power] total = " << total_rhs_power
+      //              << " pressure = " << Pp
+      //              << ", viscous = "      << Ptau
+      //              << ", sum = "          << (Pp + Ptau) << '\n'
+      //              << "[sanity] RHS split rel = " << rhs_rel
+      //              << ", de split rel = "        << de_rel
+      //              << std::endl;
+      // }
+
+
+
    }
    else // not p_assembly
    {
@@ -691,6 +785,79 @@ double LagrangianHydroOperator::KineticEnergy(const ParGridFunction &v) const
 
    return 0.5*glob_ke;
 }
+
+double LagrangianHydroOperator::IntegrateL2Field(const Vector &z) const
+{
+   double glob = 0.0, local = 0.0;
+
+   if (L2.GetNE() > 0) // UsesTensorBasis does not handle empty local mesh
+   {
+      auto ordering =
+         UsesTensorBasis(L2) ?
+         ElementDofOrdering::LEXICOGRAPHIC : ElementDofOrdering::NATIVE;
+
+      auto qi = L2.GetQuadratureInterpolator(ir);
+      qi->SetOutputLayout(QVectorLayout::byVDIM);
+      auto r  = L2.GetElementRestriction(ordering);
+
+      const int NQ = ir.GetNPoints();
+      const int ND = L2.GetFE(0)->GetDof();
+
+      Vector e_vec(NE*ND), q_val(NE*NQ);
+      r->Mult(z, e_vec);
+      qi->Values(e_vec, q_val);
+
+      // identical to your InternalEnergy integrator (norm=1.0, VDIM=1)
+      local = ComputeVolumeIntegral(L2, dim, NE, NQ, Q1D, 1, 1.0,
+                                    qdata.rho0DetJ0w, q_val);
+   }
+
+   MPI_Allreduce(&local, &glob, 1, MPI_DOUBLE, MPI_SUM, L2.GetComm());
+   return glob;
+}
+
+double LagrangianHydroOperator::ComputeTotalWork(const Vector &v, double dt) const
+{
+   Vector e_rhs_total(L2Vsize), de_total(L2Vsize);
+   
+   // Compute total energy RHS and solve
+   ForcePA->MultTranspose(v, e_rhs_total);
+   CG_EMass.Mult(e_rhs_total, de_total);
+   
+   // Integrate to get power, multiply by dt for work
+   const double total_power = IntegrateL2Field(de_total);
+   return total_power * dt;
+}
+
+double LagrangianHydroOperator::ComputePressureWork(const Vector &v, double dt) const
+{
+   Vector e_rhs_p(L2Vsize), de_p(L2Vsize);
+   
+   // Compute pressure energy RHS and solve
+   e_rhs_p = 0.0;
+   ForcePA_pressure->MultTranspose(v, e_rhs_p);
+   CG_EMass.Mult(e_rhs_p, de_p);
+   
+   // Integrate to get power, multiply by dt for work
+   const double pressure_power = IntegrateL2Field(de_p);
+   return pressure_power * dt;
+}
+
+double LagrangianHydroOperator::ComputeViscousWork(const Vector &v, double dt) const
+{
+   Vector e_rhs_tau(L2Vsize), de_tau(L2Vsize);
+   
+   // Compute viscous energy RHS and solve
+   e_rhs_tau = 0.0;
+   ForcePA_viscous->MultTranspose(v, e_rhs_tau);
+   CG_EMass.Mult(e_rhs_tau, de_tau);
+   
+   // Integrate to get power, multiply by dt for work
+   const double viscous_power = IntegrateL2Field(de_tau);
+   return viscous_power * dt;
+}
+
+
 
 void LagrangianHydroOperator::PrintTimingData(bool IamRoot, int steps,
                                               const bool fom) const
@@ -1123,7 +1290,13 @@ void QUpdateBody(const int NE, const int e,
       kernels::Add(DIM, DIM, visc_coeff, viscous_stress, sgrad_v, viscous_stress);
 
       for (int k = 0; k < DIM2; k++){
-         stress[k] = pressure_stress[k] + viscous_stress[k];
+         if (use_viscosity){
+            stress[k] = pressure_stress[k] + viscous_stress[k];
+         } else{
+            stress[k] = pressure_stress[k];
+            viscous_stress[k] = 0.0;
+         }
+         
       }
    }
    // Time step estimate at the point. Here the more relevant length
@@ -1164,8 +1337,8 @@ void QUpdateBody(const int NE, const int e,
       {
          const int offset = eq + NQ*NE*(gd + vd*DIM);
          d_stressJinvT[offset] = stressJiT[vd + gd*DIM];
-         // d_pressureJinvT[offset] = pressureJiT[vd + gd*DIM];
-         // d_viscousJinvT[offset] = viscousJiT[vd + gd*DIM];
+         d_pressureJinvT[offset] = pressureJiT[vd + gd*DIM];
+         d_viscousJinvT[offset] = viscousJiT[vd + gd*DIM];
       }
    }
 }
@@ -1427,7 +1600,7 @@ void QUpdate::UpdateQuadratureData(const Vector &S, QuadratureData &qdata)
                cfl, infinity, gamma_gf, ir.GetWeights(), q_dx,
                qdata.rho0DetJ0w, q_e, q_dv,
                qdata.Jac0inv, q_dt_est,
-               qdata.stressJinvT, qdata.pressureJinvT, qdata.stressJinvT);
+               qdata.stressJinvT, qdata.pressureJinvT, qdata.viscousJinvT);
    qdata.dt_est = q_dt_est.Min();
    LAGHOS_DEVICE_SYNC;
    timer->sw_qdata.Stop();

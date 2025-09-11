@@ -136,6 +136,12 @@ protected:
    mutable MixedBilinearForm Force;
    // Same as above, but done through partial assembly.
    ForcePAOperator *ForcePA;
+
+   ForcePAOperator *ForcePA_pressure;
+   ForcePAOperator *ForcePA_viscous;
+
+   double IntegrateL2Field(const Vector &z) const;
+
    // Mass matrices done through partial assembly:
    // velocity (coupled H1 assembly) and energy (local L2 assemblies).
    MassPAOperator *VMassPA, *EMassPA;
@@ -145,6 +151,7 @@ protected:
    mutable TimingData timer;
    mutable QUpdate *qupdate;
    mutable Vector X, B, one, rhs, e_rhs;
+   mutable Vector e_rhs_p, e_rhs_tau;
    mutable ParGridFunction rhs_c_gf, dvc_gf;
    mutable Array<int> c_tdofs[3];
 
@@ -202,6 +209,10 @@ public:
    const Array<int> &GetBlockOffsets() const { return block_offsets; }
 
    void PrintTimingData(bool IamRoot, int steps, const bool fom) const;
+
+   double ComputeTotalWork(const Vector &v, double dt) const;
+   double ComputePressureWork(const Vector &v, double dt) const;
+   double ComputeViscousWork(const Vector &v, double dt) const;
 };
 
 // TaylorCoefficient used in the 2D Taylor-Green problem.

@@ -109,11 +109,16 @@ private:
    const int D1D, Q1D, L1D, H1sz, L2sz;
    const DofToQuad *L2D2Q, *H1D2Q;
    mutable Vector X, Y;
+   const DenseTensor *stress_tensor;
+
+   const DenseTensor *SJiT;
 public:
    ForcePAOperator(const QuadratureData&,
                    ParFiniteElementSpace&,
                    ParFiniteElementSpace&,
-                   const IntegrationRule&);
+                   const IntegrationRule&,
+                   const DenseTensor *tensor = nullptr);
+
    virtual void Mult(const Vector&, Vector&) const;
    virtual void MultTranspose(const Vector&, Vector&) const;
 };
