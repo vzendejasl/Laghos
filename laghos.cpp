@@ -70,6 +70,10 @@ using namespace mfem;
 
 // Choice for the problem setup.
 static int problem, dim;
+static double p0_user = -1.0;
+static double mach_number = -1.0;
+static double mach_u0 = 1.0;
+static double p0_scale = 1.0;
 
 // Forward declarations.
 double e0(const Vector &);
@@ -115,6 +119,7 @@ int main(int argc, char *argv[])
    bool visit = false;
    bool gfprint = false;
    const char *basename = "results/Laghos";
+   const char *diag_file = "";
    int partition_type = 0;
    const char *device = "cpu";
    bool check = false;
@@ -176,6 +181,14 @@ int main(int argc, char *argv[])
                   "Enable or disable result output (files in mfem format).");
    args.AddOption(&basename, "-k", "--outputfilename",
                   "Name of the visit dump files");
+   args.AddOption(&p0_user, "-p0", "--pressure0",
+                  "Background pressure for problem 0 (overrides default).");
+   args.AddOption(&mach_number, "-mach", "--mach-number",
+                  "Mach number for problem 0 (overrides -p0).");
+   args.AddOption(&mach_u0, "-u0", "--mach-uref",
+                  "Reference velocity for Mach number in problem 0.");
+   args.AddOption(&diag_file, "-diag", "--diag-file",
+                  "Write per-step diagnostics to a text file (root rank).");
    args.AddOption(&partition_type, "-pt", "--partition",
                   "Customized x/y/z Cartesian MPI partitioning of the serial mesh.\n\t"
                   "Here x,y,z are relative task ratios in each direction.\n\t"
@@ -530,6 +543,27 @@ int main(int argc, char *argv[])
    // is to get a high-order representation of the initial condition. Note that
    // this density is a temporary function and it will not be updated during the
    // time evolution.
+   if (problem == 0)
+   {
+      const double p0_ref = (dim == 3) ? 100.0 : 1.0;
+      Vector x0(dim); x0 = 0.0;
+      const double rho_ref = rho0(x0);
+      const double gamma_ref = gamma_func(x0);
+      double p0_eff = (p0_user > 0.0) ? p0_user : p0_ref;
+      if (mach_number > 0.0)
+      {
+         p0_eff = rho_ref * mach_u0 * mach_u0 /
+                  (gamma_ref * mach_number * mach_number);
+      }
+      p0_scale = p0_eff / p0_ref;
+      if (Mpi::Root() && (p0_user > 0.0 || mach_number > 0.0))
+      {
+         const double c0 = sqrt(gamma_ref * p0_eff / rho_ref);
+         const double mach_eff = mach_u0 / c0;
+         cout << "Problem 0 background pressure p0 = " << p0_eff
+              << ", Mach (Uref=" << mach_u0 << ") = " << mach_eff << endl;
+      }
+   }
    ParGridFunction rho0_gf(&L2FESpace);
    FunctionCoefficient rho0_coeff(rho0);
    L2_FECollection l2_fec(order_e, pmesh->Dimension());
@@ -629,6 +663,19 @@ int main(int argc, char *argv[])
       visit_dc.SetTime(0.0);
       visit_dc.Save();
    }
+   std::ofstream diag_ofs;
+   const bool diag_output = (diag_file && diag_file[0] != '\0');
+   if (diag_output && Mpi::Root())
+   {
+      diag_ofs.open(diag_file);
+      MFEM_VERIFY(diag_ofs.is_open(),
+                  "Unable to open diagnostics file.");
+      diag_ofs.setf(std::ios::scientific, std::ios::floatfield);
+      diag_ofs.precision(15);
+      diag_ofs << "step,\tt,\tdt,\te_norm,\tinternal_energy,\tkinetic_energy,"
+               << "\ttotal_energy,\ttotal_work,\tpressure_work,\tviscous_work,"
+               << "\twork_sum,\twork_verification" << std::endl;
+   }
 
    // Perform time-integration (looping over the time iterations, ti, with a
    // time-step dt). The object oper is of type LagrangianHydroOperator that
@@ -711,34 +758,48 @@ int main(int argc, char *argv[])
       // and the oper object might have redirected the mesh positions to those.
       pmesh->NewNodes(x_gf, false);
 
-      if (last_step || (ti % vis_steps) == 0)
+      const bool vis_step = last_step || (ti % vis_steps) == 0;
+      const bool log_step = vis_step || diag_output;
+      double sqrt_norm = 0.0;
+      double internal_energy = 0.0;
+      double kinetic_energy = 0.0;
+      double total_work = 0.0;
+      double pressure_work = 0.0;
+      double viscous_work = 0.0;
+      if (log_step)
       {
          double lnorm = e_gf * e_gf, norm;
          MPI_Allreduce(&lnorm, &norm, 1, MPI_DOUBLE, MPI_SUM, pmesh->GetComm());
+         sqrt_norm = sqrt(norm);
          if (mem_usage)
          {
             mem = GetMaxRssMB();
             MPI_Reduce(&mem, &mmax, 1, MPI_LONG, MPI_MAX, 0, pmesh->GetComm());
             MPI_Reduce(&mem, &msum, 1, MPI_LONG, MPI_SUM, 0, pmesh->GetComm());
          }
-         const double internal_energy = hydro.InternalEnergy(e_gf);
-         const double kinetic_energy = hydro.KineticEnergy(v_gf);
-         if (Mpi::Root())
+         internal_energy = hydro.InternalEnergy(e_gf);
+         kinetic_energy = hydro.KineticEnergy(v_gf);
+         // Compute work contributions over this timestep
+         total_work = hydro.ComputeTotalWork(v_gf, dt);
+         pressure_work = hydro.ComputePressureWork(v_gf, dt);
+         viscous_work = hydro.ComputeViscousWork(v_gf, dt);
+      }
+      if (Mpi::Root())
+      {
+         if (vis_step)
          {
-            const double sqrt_norm = sqrt(norm);
-
             cout << std::fixed;
             cout << "step " << std::setw(5) << ti
                  << ",\tt = " << std::setw(5) << std::setprecision(4) << t
                  << ",\tdt = " << std::setw(5) << std::setprecision(6) << dt
                  << ",\t|e| = " << std::setprecision(10) << std::scientific
                  << sqrt_norm
-            << ",\t|IE| = " << std::setprecision(10) << std::scientific
-            << internal_energy
-             << ",\t|KE| = " << std::setprecision(10) << std::scientific
-            << kinetic_energy
-             << ",\t|E| = " << std::setprecision(10) << std::scientific
-            << kinetic_energy+internal_energy;
+                 << ",\t|IE| = " << std::setprecision(10) << std::scientific
+                 << internal_energy
+                 << ",\t|KE| = " << std::setprecision(10) << std::scientific
+                 << kinetic_energy
+                 << ",\t|E| = " << std::setprecision(10) << std::scientific
+                 << kinetic_energy+internal_energy;
             cout << std::fixed;
             if (mem_usage)
             {
@@ -746,7 +807,38 @@ int main(int argc, char *argv[])
             }
             cout << endl;
          }
+         if (vis_step)
+         {
+            cout << "[work] dt=" << std::scientific << std::setprecision(6) << dt 
+                 << ", total=" << total_work
+                 << ", pressure=" << pressure_work 
+                 << ", viscous=" << viscous_work
+                 << ", sum=" << (pressure_work + viscous_work)
+                 << ", verification=" << (total_work - (pressure_work + viscous_work))
+                 << endl;
+         }
+         if (diag_output)
+         {
+            const double total_energy = kinetic_energy + internal_energy;
+            const double work_sum = pressure_work + viscous_work;
+            const double work_verification = total_work - work_sum;
+            diag_ofs << ti << ",\t"
+                     << t << ",\t"
+                     << dt << ",\t"
+                     << sqrt_norm << ",\t"
+                     << internal_energy << ",\t"
+                     << kinetic_energy << ",\t"
+                     << total_energy << ",\t"
+                     << total_work << ",\t"
+                     << pressure_work << ",\t"
+                     << viscous_work << ",\t"
+                     << work_sum << ",\t"
+                     << work_verification << std::endl;
+         }
+      }
 
+      if (vis_step)
+      {
          // Make sure all ranks have sent their 'v' solution before initiating
          // another set of GLVis connections (one from each rank):
          MPI_Barrier(pmesh->GetComm());
@@ -806,25 +898,6 @@ int main(int argc, char *argv[])
             e_ofs.precision(8);
             e_gf.SaveAsOne(e_ofs);
             e_ofs.close();
-         }
-
-            
-   
-         Vector &v_current = S.GetBlock(1); // velocity is block 1
-         // Compute work contributions over this timestep
-         const double total_work = hydro.ComputeTotalWork(v_gf, dt);
-         const double pressure_work = hydro.ComputePressureWork(v_gf, dt);
-         const double viscous_work = hydro.ComputeViscousWork(v_gf, dt);
-   
-         if (Mpi::Root())
-         {
-            cout << "[work] dt=" << std::scientific << std::setprecision(6) << dt 
-                 << ", total=" << total_work
-                 << ", pressure=" << pressure_work 
-                 << ", viscous=" << viscous_work
-                 << ", sum=" << (pressure_work + viscous_work)
-                 << ", verification=" << (total_work - (pressure_work + viscous_work))
-                 << endl;
          }
       }
 
@@ -1027,7 +1100,9 @@ double e0(const Vector &x)
    {
       case 0:
       {
-         const double denom = 2.0 / 3.0;  // (5/3 - 1) * density.
+         const double rho = rho0(x);
+         const double gamma = gamma_func(x);
+         const double denom = (gamma - 1.0) * rho;
          double val;
          if (x.Size() == 2)
          {
@@ -1038,7 +1113,8 @@ double e0(const Vector &x)
             val = 100.0 + ((cos(2*M_PI*x(2)) + 2) *
                            (cos(2*M_PI*x(0)) + cos(2*M_PI*x(1))) - 2) / 16.0;
          }
-         return val/denom;
+         val *= p0_scale;
+         return val / denom;
       }
       case 1: return 0.0; // This case in initialized in main().
       case 2: return (x(0) < 0.5) ? 1.0 / rho0(x) / (gamma_func(x) - 1.0)
