@@ -115,6 +115,9 @@ int main(int argc, char *argv[])
    int max_tsteps = -1;
    bool p_assembly = true;
    bool impose_visc = false;
+   bool fixed_viscosity = false;
+   double reynolds = -1.0;
+   double viscosity_const = -1.0;
    bool visualization = false;
    int vis_steps = 5;
    bool visit = false;
@@ -171,6 +174,11 @@ int main(int argc, char *argv[])
    args.AddOption(&impose_visc, "-iv", "--impose-viscosity", "-niv",
                   "--no-impose-viscosity",
                   "Use active viscosity terms even for smooth problems.");
+   args.AddOption(&fixed_viscosity, "-fv", "--fixed-viscosity", "-nfv",
+                  "--no-fixed-viscosity",
+                  "Use constant physical viscosity (overrides artificial).");
+   args.AddOption(&reynolds, "-Re", "--reynolds",
+                  "Reynolds number for fixed viscosity (L=1/(2*pi)).");
    args.AddOption(&visualization, "-vis", "--visualization", "-no-vis",
                   "--no-visualization",
                   "Enable or disable GLVis visualization.");
@@ -617,12 +625,32 @@ int main(int argc, char *argv[])
       default: MFEM_ABORT("Wrong problem specification!");
    }
    if (impose_visc) { visc = true; }
+   if (fixed_viscosity)
+   {
+      MFEM_VERIFY(reynolds > 0.0,
+                  "Fixed viscosity requires a positive Reynolds number.");
+      Vector x0(dim); x0 = 0.0;
+      const double rho_ref = rho0(x0);
+      const double L = 1.0 / (2.0 * M_PI);
+      viscosity_const = rho_ref * mach_u0 * L / reynolds;
+      if (Mpi::Root())
+      {
+         cout << "Fixed viscosity enabled: Re = " << reynolds
+              << ", mu = " << viscosity_const << endl;
+      }
+      visc = true;
+   }
+   else
+   {
+      viscosity_const = -1.0;
+   }
 
    hydrodynamics::LagrangianHydroOperator hydro(S.Size(),
                                                 H1FESpace, L2FESpace, ess_tdofs,
                                                 rho0_coeff, rho0_gf,
                                                 mat_gf, source, cfl,
-                                                visc, vorticity, p_assembly,
+                                                visc, vorticity, viscosity_const,
+                                                p_assembly,
                                                 cg_tol, cg_max_iter, ftz_tol,
                                                 order_q);
 

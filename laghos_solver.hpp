@@ -60,6 +60,7 @@ class QUpdate
 private:
    const int dim, vdim, NQ, NE, Q1D;
    const bool use_viscosity, use_vorticity;
+   const double viscosity_const;
    const double cfl;
    TimingData *timer;
    const IntegrationRule &ir;
@@ -71,13 +72,15 @@ private:
 public:
    QUpdate(const int d, const int ne, const int q1d,
            const bool visc, const bool vort,
+           const double visc_const,
            const double cfl, TimingData *t,
            const ParGridFunction &gamma_gf,
            const IntegrationRule &ir,
            ParFiniteElementSpace &h1, ParFiniteElementSpace &l2):
       dim(d), vdim(h1.GetVDim()),
       NQ(ir.GetNPoints()), NE(ne), Q1D(q1d),
-      use_viscosity(visc), use_vorticity(vort), cfl(cfl),
+      use_viscosity(visc), use_vorticity(vort),
+      viscosity_const(visc_const), cfl(cfl),
       timer(t), ir(ir), H1(h1), L2(l2),
       H1R(H1.GetElementRestriction(ElementDofOrdering::LEXICOGRAPHIC)),
       q_dt_est(NE*NQ),
@@ -114,6 +117,7 @@ protected:
    const int dim, NE, l2dofs_cnt, h1dofs_cnt, source_type;
    const double cfl;
    const bool use_viscosity, use_vorticity, p_assembly;
+   const double viscosity_const;
    const double cg_rel_tol;
    const int cg_max_iter;
    const double ftz_tol;
@@ -179,7 +183,8 @@ public:
                            ParGridFunction &gamma_gf,
                            const int source,
                            const double cfl,
-                           const bool visc, const bool vort, const bool pa,
+                           const bool visc, const bool vort,
+                           const double visc_const, const bool pa,
                            const double cgt, const int cgiter, double ftz_tol,
                            const int order_q);
    ~LagrangianHydroOperator();

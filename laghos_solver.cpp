@@ -102,6 +102,7 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
                                                  const double cfl,
                                                  const bool visc,
                                                  const bool vort,
+                                                 const double visc_const,
                                                  const bool p_assembly,
                                                  const double cgt,
                                                  const int cgiter,
@@ -126,6 +127,7 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    source_type(source), cfl(cfl),
    use_viscosity(visc),
    use_vorticity(vort),
+   viscosity_const(visc_const),
    p_assembly(p_assembly),
    cg_rel_tol(cgt), cg_max_iter(cgiter),ftz_tol(ftz),
    gamma_gf(gamma_gf),
@@ -187,7 +189,7 @@ if (Mpi::Root()) {
 
    if (p_assembly)
    {
-      qupdate = new QUpdate(dim, NE, Q1D, visc, vort, cfl,
+      qupdate = new QUpdate(dim, NE, Q1D, visc, vort, visc_const, cfl,
                             &timer, gamma_gf, ir, H1, L2);
       ForcePA = new ForcePAOperator(qdata, H1, L2, ir);
       ForcePA_pressure = new ForcePAOperator(qdata, H1, L2, ir, &qdata.pressureJinvT);
@@ -1041,18 +1043,18 @@ void LagrangianHydroOperator::UpdateQuadratureData(const Vector &S) const
             double visc_coeff = 0.0;
             if (use_viscosity)
             {
+               v.GetVectorGradient(*T, sgrad_v);
                // Compression-based length scale at the point. The first
                // eigenvector of the symmetric velocity gradient gives the
-               // direction of maximal compression. This is used to define the
-               // relative change of the initial length scale.
-               v.GetVectorGradient(*T, sgrad_v);
-
+               // direction of maximal compression. This is used to define
+               // the relative change of the initial length scale.
                double vorticity_coeff = 1.0;
                if (use_vorticity)
                {
                   const double grad_norm = sgrad_v.FNorm();
                   const double div_v = fabs(sgrad_v.Trace());
-                  vorticity_coeff = (grad_norm > 0.0) ? div_v / grad_norm : 1.0;
+                  vorticity_coeff =
+                     (grad_norm > 0.0) ? div_v / grad_norm : 1.0;
                }
 
                sgrad_v.Symmetrize();
@@ -1078,9 +1080,19 @@ void LagrangianHydroOperator::UpdateQuadratureData(const Vector &S) const
                // eps must be scaled appropriately if a different unit system is
                // being used.
                const double eps = 1e-12;
-               visc_coeff += 0.5 * rho * h * sound_speed * vorticity_coeff *
+               visc_coeff += 0.5 * rho * h * sound_speed *
+                             vorticity_coeff *
                              (1.0 - smooth_step_01(mu - 2.0 * eps, eps));
+               if (viscosity_const >= 0.0) { visc_coeff = viscosity_const; }
                stress.Add(visc_coeff, sgrad_v);
+               if (viscosity_const >= 0.0)
+               {
+                  const double div_v = sgrad_v.Trace();
+                  for (int d = 0; d < dim; d++)
+                  {
+                     stress(d, d) -= (2.0 / 3.0) * visc_coeff * div_v;
+                  }
+               }
             }
             // Time step estimate at the point. Here the more relevant length
             // scale is related to the actual mesh deformation; we use the min
@@ -1188,6 +1200,7 @@ void QUpdateBody(const int NE, const int e,
                  const int NQ, const int q,
                  const bool use_viscosity,
                  const bool use_vorticity,
+                 const double viscosity_const,
                  const double h0,
                  const double h1order,
                  const double cfl,
@@ -1286,8 +1299,19 @@ void QUpdateBody(const int NE, const int e,
       const double eps = 1e-12;
       visc_coeff += 0.5 * R * H  * S * vorticity_coeff *
                     (1.0 - smooth_step_01(mu-2.0*eps, eps));
+      if (viscosity_const >= 0.0) { visc_coeff = viscosity_const; }
+      kernels::Add(DIM, DIM, visc_coeff,
+                   viscous_stress, sgrad_v, viscous_stress);
+      if (viscosity_const >= 0.0)
+      {
+         const double div_v = Trace<DIM,DIM>(sgrad_v);
+         for (int d = 0; d < DIM; d++)
+         {
+            viscous_stress[d*DIM + d] -=
+               (2.0 / 3.0) * visc_coeff * div_v;
+         }
+      }
       // kernels::Add(DIM, DIM, visc_coeff, stress, sgrad_v, stress);
-      kernels::Add(DIM, DIM, visc_coeff, viscous_stress, sgrad_v, viscous_stress);
 
       for (int k = 0; k < DIM2; k++){
          if (use_viscosity){
@@ -1440,6 +1464,7 @@ template<int DIM, int Q1D> static inline
 void QKernel(const int NE, const int NQ,
              const bool use_viscosity,
              const bool use_vorticity,
+             const double viscosity_const,
              const double h0,
              const double h1order,
              const double cfl,
@@ -1490,7 +1515,8 @@ void QKernel(const int NE, const int NQ,
             MFEM_FOREACH_THREAD(qy,y,Q1D)
             {
                QUpdateBody<DIM>(NE, e, NQ, qx + qy * Q1D,
-                                use_viscosity, use_vorticity, h0, h1order, cfl, infinity,
+                                use_viscosity, use_vorticity, viscosity_const,
+                                h0, h1order, cfl, infinity,
                                 Jinv, stress, sgrad_v, eig_val_data, eig_vec_data,
                                 compr_dir, Jpi, ph_dir,
                                 stressJiT,
@@ -1529,7 +1555,8 @@ void QKernel(const int NE, const int NQ,
                MFEM_FOREACH_THREAD(qz,z,Q1D)
                {
                   QUpdateBody<DIM>(NE, e, NQ, qx + Q1D * (qy + qz * Q1D),
-                                   use_viscosity, use_vorticity, h0, h1order, cfl, infinity,
+                                   use_viscosity, use_vorticity, viscosity_const,
+                                   h0, h1order, cfl, infinity,
                                    Jinv, stress, sgrad_v, eig_val_data, eig_vec_data,
                                    compr_dir, Jpi, ph_dir,
                                    stressJiT,
@@ -1571,6 +1598,7 @@ void QUpdate::UpdateQuadratureData(const Vector &S, QuadratureData &qdata)
    typedef void (*fQKernel)(const int NE, const int NQ,
                             const bool use_viscosity,
                             const bool use_vorticity,
+                            const double viscosity_const,
                             const double h0, const double h1order,
                             const double cfl, const double infinity,
                             const ParGridFunction &gamma_gf,
@@ -1596,7 +1624,8 @@ void QUpdate::UpdateQuadratureData(const Vector &S, QuadratureData &qdata)
       mfem::out << "Unknown kernel 0x" << std::hex << id << std::endl;
       MFEM_ABORT("Unknown kernel");
    }
-   qupdate[id](NE, NQ, use_viscosity, use_vorticity, qdata.h0, h1order,
+   qupdate[id](NE, NQ, use_viscosity, use_vorticity, viscosity_const,
+               qdata.h0, h1order,
                cfl, infinity, gamma_gf, ir.GetWeights(), q_dx,
                qdata.rho0DetJ0w, q_e, q_dv,
                qdata.Jac0inv, q_dt_est,
