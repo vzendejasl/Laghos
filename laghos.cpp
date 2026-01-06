@@ -73,7 +73,7 @@ static int problem, dim;
 static double p0_user = -1.0;
 static double mach_number = -1.0;
 static double mach_u0 = 1.0;
-static double p0_scale = 1.0;
+static double p0_background = 1.0;
 
 // Forward declarations.
 double e0(const Vector &);
@@ -84,6 +84,7 @@ void v0(const Vector &, Vector &);
 static long GetMaxRssMB();
 static void display_banner(std::ostream&);
 static void Checks(const int ti, const double norm, int &checks);
+static double ComputeEnstrophy(const ParGridFunction &v_gf);
 
 int main(int argc, char *argv[])
 {
@@ -182,7 +183,7 @@ int main(int argc, char *argv[])
    args.AddOption(&basename, "-k", "--outputfilename",
                   "Name of the visit dump files");
    args.AddOption(&p0_user, "-p0", "--pressure0",
-                  "Background pressure for problem 0 (overrides default).");
+                  "Background pressure for problem 0 (used if -mach not set).");
    args.AddOption(&mach_number, "-mach", "--mach-number",
                   "Mach number for problem 0 (overrides -p0).");
    args.AddOption(&mach_u0, "-u0", "--mach-uref",
@@ -545,23 +546,29 @@ int main(int argc, char *argv[])
    // time evolution.
    if (problem == 0)
    {
-      const double p0_ref = (dim == 3) ? 100.0 : 1.0;
       Vector x0(dim); x0 = 0.0;
       const double rho_ref = rho0(x0);
       const double gamma_ref = gamma_func(x0);
-      double p0_eff = (p0_user > 0.0) ? p0_user : p0_ref;
-      if (mach_number > 0.0)
+      double mach_eff = mach_number;
+      if (mach_eff <= 0.0)
       {
-         p0_eff = rho_ref * mach_u0 * mach_u0 /
-                  (gamma_ref * mach_number * mach_number);
+         const double p0_ref = (dim == 3) ? 100.0 : 1.0;
+         const double p0_input = (p0_user > 0.0) ? p0_user : p0_ref;
+         const double c0 = sqrt(gamma_ref * p0_input / rho_ref);
+         mach_eff = mach_u0 / c0;
       }
-      p0_scale = p0_eff / p0_ref;
-      if (Mpi::Root() && (p0_user > 0.0 || mach_number > 0.0))
+      p0_background = rho_ref * mach_u0 * mach_u0 /
+                      (gamma_ref * mach_eff * mach_eff);
+      if (Mpi::Root())
       {
-         const double c0 = sqrt(gamma_ref * p0_eff / rho_ref);
-         const double mach_eff = mach_u0 / c0;
-         cout << "Problem 0 background pressure p0 = " << p0_eff
-              << ", Mach (Uref=" << mach_u0 << ") = " << mach_eff << endl;
+         const double cs = sqrt(gamma_ref * p0_background / rho_ref);
+         const double mach_out = mach_u0 / cs;
+         const double L = 1.0 / (2.0 * M_PI);
+         const double Eu0 = rho_ref * mach_u0 * mach_u0 *
+                            (M_PI * L) * (M_PI * L) * (M_PI * L);
+         cout << "The initial Mach number is: " << mach_out << endl;
+         cout << "The background pressure is: " << p0_background << endl;
+         cout << "The hydrodynamic energy is : " << Eu0 << endl;
       }
    }
    ParGridFunction rho0_gf(&L2FESpace);
@@ -671,11 +678,16 @@ int main(int argc, char *argv[])
       MFEM_VERIFY(diag_ofs.is_open(),
                   "Unable to open diagnostics file.");
       diag_ofs.setf(std::ios::scientific, std::ios::floatfield);
-      diag_ofs.precision(15);
-      diag_ofs << "step,\tt,\tdt,\te_norm,\tinternal_energy,\tkinetic_energy,"
-               << "\ttotal_energy,\ttotal_work,\tpressure_work,\tviscous_work,"
-               << "\twork_sum,\twork_verification" << std::endl;
+      diag_ofs.setf(std::ios::showpos);
+      diag_ofs.precision(13);
+      diag_ofs << "            time,               cycle,           time_step,"
+               << "      kinetic_energy,     internal_energy,           enstrophy,"
+               << "                mass,Host Memory Use (GB),"
+               << "         total_power,      pressure_power,"
+               << "       viscous_power" << std::endl;
    }
+   ConstantCoefficient zero_coeff(0.0);
+   const double mass0 = diag_output ? rho0_gf.ComputeL1Error(zero_coeff) : 0.0;
 
    // Perform time-integration (looping over the time iterations, ti, with a
    // time-step dt). The object oper is of type LagrangianHydroOperator that
@@ -689,6 +701,37 @@ int main(int argc, char *argv[])
    long mem=0, mmax=0, msum=0;
    int checks = 0;
 
+   if (diag_output)
+   {
+      double mem_gb = 0.0;
+      const double total_power0 = 0.0;
+      const double pressure_power0 = 0.0;
+      const double viscous_power0 = 0.0;
+      if (mem_usage)
+      {
+         mem = GetMaxRssMB();
+         MPI_Reduce(&mem, &mmax, 1, MPI_LONG, MPI_MAX, 0, pmesh->GetComm());
+         MPI_Reduce(&mem, &msum, 1, MPI_LONG, MPI_SUM, 0, pmesh->GetComm());
+         mem_gb = static_cast<double>(mmax) / 1024.0;
+      }
+      const double internal_energy0 = hydro.InternalEnergy(e_gf);
+      const double kinetic_energy0 = hydro.KineticEnergy(v_gf);
+      const double enstrophy0 = ComputeEnstrophy(v_gf);
+      if (Mpi::Root())
+      {
+         diag_ofs << t << ","
+                  << 0.0 << ","
+                  << dt << ","
+                  << kinetic_energy0 << ","
+                  << internal_energy0 << ","
+                  << enstrophy0 << ","
+                  << mass0 << ","
+                  << mem_gb << ","
+                  << total_power0 << ","
+                  << pressure_power0 << ","
+                  << viscous_power0 << std::endl;
+      }
+   }
 
    //   const double internal_energy = hydro.InternalEnergy(e_gf);
    //   const double kinetic_energy = hydro.KineticEnergy(v_gf);
@@ -766,6 +809,7 @@ int main(int argc, char *argv[])
       double total_work = 0.0;
       double pressure_work = 0.0;
       double viscous_work = 0.0;
+      double enstrophy = 0.0;
       if (log_step)
       {
          double lnorm = e_gf * e_gf, norm;
@@ -783,6 +827,7 @@ int main(int argc, char *argv[])
          total_work = hydro.ComputeTotalWork(v_gf, dt);
          pressure_work = hydro.ComputePressureWork(v_gf, dt);
          viscous_work = hydro.ComputeViscousWork(v_gf, dt);
+         if (diag_output) { enstrophy = ComputeEnstrophy(v_gf); }
       }
       if (Mpi::Root())
       {
@@ -807,7 +852,7 @@ int main(int argc, char *argv[])
             }
             cout << endl;
          }
-         if (vis_step)
+         if (log_step)
          {
             cout << "[work] dt=" << std::scientific << std::setprecision(6) << dt 
                  << ", total=" << total_work
@@ -819,21 +864,23 @@ int main(int argc, char *argv[])
          }
          if (diag_output)
          {
-            const double total_energy = kinetic_energy + internal_energy;
-            const double work_sum = pressure_work + viscous_work;
-            const double work_verification = total_work - work_sum;
-            diag_ofs << ti << ",\t"
-                     << t << ",\t"
-                     << dt << ",\t"
-                     << sqrt_norm << ",\t"
-                     << internal_energy << ",\t"
-                     << kinetic_energy << ",\t"
-                     << total_energy << ",\t"
-                     << total_work << ",\t"
-                     << pressure_work << ",\t"
-                     << viscous_work << ",\t"
-                     << work_sum << ",\t"
-                     << work_verification << std::endl;
+            const double mem_gb =
+               mem_usage ? static_cast<double>(mmax) / 1024.0 : 0.0;
+            const double inv_dt = (dt > 0.0) ? 1.0 / dt : 0.0;
+            const double total_power = total_work * inv_dt;
+            const double pressure_power = pressure_work * inv_dt;
+            const double viscous_power = viscous_work * inv_dt;
+            diag_ofs << t << ","
+                     << static_cast<double>(ti) << ","
+                     << dt << ","
+                     << kinetic_energy << ","
+                     << internal_energy << ","
+                     << enstrophy << ","
+                     << mass0 << ","
+                     << mem_gb << ","
+                     << total_power << ","
+                     << pressure_power << ","
+                     << viscous_power << std::endl;
          }
       }
 
@@ -1103,17 +1150,22 @@ double e0(const Vector &x)
          const double rho = rho0(x);
          const double gamma = gamma_func(x);
          const double denom = (gamma - 1.0) * rho;
+         const double L = 1.0 / (2.0 * M_PI);
+         const double k = 2.0 / L;
+         const double p0 = p0_background;
+         const double rho0u0u0 = rho * mach_u0 * mach_u0;
          double val;
          if (x.Size() == 2)
          {
-            val = 1.0 + (cos(2*M_PI*x(0)) + cos(2*M_PI*x(1))) / 4.0;
+            val = p0 + (rho0u0u0 / 4.0) *
+                        (cos(k*x(0)) + cos(k*x(1)));
          }
          else
          {
-            val = 100.0 + ((cos(2*M_PI*x(2)) + 2) *
-                           (cos(2*M_PI*x(0)) + cos(2*M_PI*x(1))) - 2) / 16.0;
+            val = p0 + (rho0u0u0 / 16.0) *
+                        (cos(k*x(0)) + cos(k*x(1))) *
+                        (cos(k*x(2)) + 2.0);
          }
-         val *= p0_scale;
          return val / denom;
       }
       case 1: return 0.0; // This case in initialized in main().
@@ -1240,4 +1292,38 @@ static void Checks(const int ti, const double nrm, int &chk)
          check(p, it, norm);
       }
    }
+}
+
+static double ComputeEnstrophy(const ParGridFunction &v_gf)
+{
+   ParFiniteElementSpace *pfes = v_gf.ParFESpace();
+   if (!pfes) { return 0.0; }
+   ParMesh *pmesh = pfes->GetParMesh();
+   if (!pmesh || pmesh->Dimension() < 2) { return 0.0; }
+
+   const int curl_dim = v_gf.CurlDim();
+   Vector curl(curl_dim);
+   double local = 0.0;
+
+   for (int e = 0; e < pfes->GetNE(); ++e)
+   {
+      ElementTransformation *tr = pfes->GetElementTransformation(e);
+      const FiniteElement *el = pfes->GetFE(e);
+      int ir_order = 2 * el->GetOrder();
+      if (ir_order < 2) { ir_order = 2; }
+      const IntegrationRule &ir = IntRules.Get(tr->GetGeometryType(), ir_order);
+      for (int i = 0; i < ir.GetNPoints(); ++i)
+      {
+         const IntegrationPoint &ip = ir.IntPoint(i);
+         tr->SetIntPoint(&ip);
+         v_gf.GetCurl(*tr, curl);
+         double curl_sq = 0.0;
+         for (int d = 0; d < curl_dim; ++d) { curl_sq += curl(d) * curl(d); }
+         local += curl_sq * ip.weight * tr->Weight();
+      }
+   }
+
+   double global = 0.0;
+   MPI_Allreduce(&local, &global, 1, MPI_DOUBLE, MPI_SUM, pmesh->GetComm());
+   return 0.5 * global;
 }
