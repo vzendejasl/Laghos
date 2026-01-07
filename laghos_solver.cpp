@@ -567,19 +567,20 @@ void LagrangianHydroOperator::SolveEnergy(const Vector &S, const Vector &v,
       const double Ptau = IntegrateL2Field(de_tau);
       const double total_rhs_power = IntegrateL2Field(de);
       
-      // // Print (use scientific to avoid hex-float surprises)
-      // if (Mpi::Root())
-      // {
-      //    std::cout.setf(std::ios::scientific, std::ios::floatfield);
-      //    std::cout.precision(6);
-      //    std::cout << "[power] total = " << total_rhs_power
-      //              << " pressure = " << Pp
-      //              << ", viscous = "      << Ptau
-      //              << ", sum = "          << (Pp + Ptau) << '\n'
-      //              << "[sanity] RHS split rel = " << rhs_rel
-      //              << ", de split rel = "        << de_rel
-      //              << std::endl;
-      // }
+      /*
+      // Print (use scientific to avoid hex-float surprises)
+      if (Mpi::Root())
+      {
+         std::cout.setf(std::ios::scientific, std::ios::floatfield);
+       std::cout.precision(6);
+          std::cout << "[power] total = " << total_rhs_power
+                    << " pressure = " << Pp
+                    << ", viscous = "      << Ptau
+                    << ", sum = "          << (Pp + Ptau) << '\n'
+                    << "[sanity] RHS split rel = " << rhs_rel
+                    << ", de split rel = "        << de_rel
+                    << std::endl;
+      }*/
 
 
 
@@ -1083,15 +1084,19 @@ void LagrangianHydroOperator::UpdateQuadratureData(const Vector &S) const
                visc_coeff += 0.5 * rho * h * sound_speed *
                              vorticity_coeff *
                              (1.0 - smooth_step_01(mu - 2.0 * eps, eps));
-               if (viscosity_const >= 0.0) { visc_coeff = viscosity_const; }
-               stress.Add(visc_coeff, sgrad_v);
                if (viscosity_const >= 0.0)
                {
+                  visc_coeff = viscosity_const;
+                  stress.Add(2.0 * visc_coeff, sgrad_v);
                   const double div_v = sgrad_v.Trace();
                   for (int d = 0; d < dim; d++)
                   {
                      stress(d, d) -= (2.0 / 3.0) * visc_coeff * div_v;
                   }
+               }
+               else
+               {
+                  stress.Add(visc_coeff, sgrad_v);
                }
             }
             // Time step estimate at the point. Here the more relevant length
@@ -1299,17 +1304,22 @@ void QUpdateBody(const int NE, const int e,
       const double eps = 1e-12;
       visc_coeff += 0.5 * R * H  * S * vorticity_coeff *
                     (1.0 - smooth_step_01(mu-2.0*eps, eps));
-      if (viscosity_const >= 0.0) { visc_coeff = viscosity_const; }
-      kernels::Add(DIM, DIM, visc_coeff,
-                   viscous_stress, sgrad_v, viscous_stress);
       if (viscosity_const >= 0.0)
       {
+         visc_coeff = viscosity_const;
+         kernels::Add(DIM, DIM, 2.0 * visc_coeff,
+                      viscous_stress, sgrad_v, viscous_stress);
          const double div_v = Trace<DIM,DIM>(sgrad_v);
          for (int d = 0; d < DIM; d++)
          {
             viscous_stress[d*DIM + d] -=
                (2.0 / 3.0) * visc_coeff * div_v;
          }
+      }
+      else
+      {
+         kernels::Add(DIM, DIM, visc_coeff,
+                      viscous_stress, sgrad_v, viscous_stress);
       }
       // kernels::Add(DIM, DIM, visc_coeff, stress, sgrad_v, stress);
 
