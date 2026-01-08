@@ -156,6 +156,10 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    e_rhs(L2Vsize),
    e_rhs_p(L2Vsize),
    e_rhs_tau(L2Vsize),
+   solve_pressure_power(0.0),
+   solve_viscous_power(0.0),
+   solve_total_power(0.0),
+   solve_power_valid(false),
    rhs_c_gf(&H1c),
    dvc_gf(&H1c)
 {
@@ -516,6 +520,7 @@ void LagrangianHydroOperator::SolveEnergy(const Vector &S, const Vector &v,
    Array<int> l2dofs;
    if (p_assembly)
    {
+      solve_power_valid = false;
       LAGHOS_DEVICE_SYNC;
       timer.sw_force.Start();
       ForcePA->MultTranspose(v, e_rhs);
@@ -566,6 +571,10 @@ void LagrangianHydroOperator::SolveEnergy(const Vector &S, const Vector &v,
       const double Pp   = IntegrateL2Field(de_p);
       const double Ptau = IntegrateL2Field(de_tau);
       const double total_rhs_power = IntegrateL2Field(de);
+      solve_pressure_power = Pp;
+      solve_viscous_power = Ptau;
+      solve_total_power = total_rhs_power;
+      solve_power_valid = true;
       
       /*
       // Print (use scientific to avoid hex-float surprises)
@@ -587,6 +596,10 @@ void LagrangianHydroOperator::SolveEnergy(const Vector &S, const Vector &v,
    }
    else // not p_assembly
    {
+      solve_pressure_power = 0.0;
+      solve_viscous_power = 0.0;
+      solve_total_power = 0.0;
+      solve_power_valid = false;
       LAGHOS_DEVICE_SYNC;
       timer.sw_force.Start();
       Force.MultTranspose(v, e_rhs);

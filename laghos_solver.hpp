@@ -158,6 +158,10 @@ protected:
    mutable Vector e_rhs_p, e_rhs_tau;
    mutable ParGridFunction rhs_c_gf, dvc_gf;
    mutable Array<int> c_tdofs[3];
+   mutable double solve_pressure_power;
+   mutable double solve_viscous_power;
+   mutable double solve_total_power;
+   mutable bool solve_power_valid;
 
    virtual void ComputeMaterialProperties(int nvalues, const double gamma[],
                                           const double rho[], const double e[],
@@ -218,6 +222,10 @@ public:
    double ComputeTotalWork(const Vector &v, double dt) const;
    double ComputePressureWork(const Vector &v, double dt) const;
    double ComputeViscousWork(const Vector &v, double dt) const;
+   double GetSolveEnergyPressurePower() const { return solve_pressure_power; }
+   double GetSolveEnergyViscousPower() const { return solve_viscous_power; }
+   double GetSolveEnergyTotalPower() const { return solve_total_power; }
+   bool HasSolveEnergyPower() const { return solve_power_valid; }
 };
 
 // TaylorCoefficient used in the 2D Taylor-Green problem.

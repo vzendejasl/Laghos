@@ -712,7 +712,8 @@ int main(int argc, char *argv[])
                << "      kinetic_energy,     internal_energy,           enstrophy,"
                << "                mass,Host Memory Use (GB),"
                << "         total_power,      pressure_power,"
-               << "       viscous_power" << std::endl;
+               << "       viscous_power,  solve_total_power,"
+               << " solve_pressure_power,  solve_viscous_power" << std::endl;
    }
    ConstantCoefficient zero_coeff(0.0);
    const double mass0 = diag_output ? rho0_gf.ComputeL1Error(zero_coeff) : 0.0;
@@ -747,6 +748,9 @@ int main(int argc, char *argv[])
       const double enstrophy0 = ComputeEnstrophy(v_gf);
       if (Mpi::Root())
       {
+         const double solve_total_power0 = 0.0;
+         const double solve_pressure_power0 = 0.0;
+         const double solve_viscous_power0 = 0.0;
          diag_ofs << t << ","
                   << 0.0 << ","
                   << dt << ","
@@ -757,7 +761,10 @@ int main(int argc, char *argv[])
                   << mem_gb << ","
                   << total_power0 << ","
                   << pressure_power0 << ","
-                  << viscous_power0 << std::endl;
+                  << viscous_power0 << ","
+                  << solve_total_power0 << ","
+                  << solve_pressure_power0 << ","
+                  << solve_viscous_power0 << std::endl;
       }
    }
 
@@ -898,6 +905,12 @@ int main(int argc, char *argv[])
             const double total_power = total_work * inv_dt;
             const double pressure_power = pressure_work * inv_dt;
             const double viscous_power = viscous_work * inv_dt;
+            const double solve_total_power =
+               hydro.GetSolveEnergyTotalPower();
+            const double solve_pressure_power =
+               hydro.GetSolveEnergyPressurePower();
+            const double solve_viscous_power =
+               hydro.GetSolveEnergyViscousPower();
             diag_ofs << t << ","
                      << static_cast<double>(ti) << ","
                      << dt << ","
@@ -908,7 +921,10 @@ int main(int argc, char *argv[])
                      << mem_gb << ","
                      << total_power << ","
                      << pressure_power << ","
-                     << viscous_power << std::endl;
+                     << viscous_power << ","
+                     << solve_total_power << ","
+                     << solve_pressure_power << ","
+                     << solve_viscous_power << std::endl;
          }
       }
 
