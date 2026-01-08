@@ -58,13 +58,21 @@
 // -m data/cube_922_hex.mesh -pt 911 for  9 / 72 / 576 / 4608 ... tasks.
 // -m data/cube_522_hex.mesh -pt 521 for 10 / 80 / 640 / 5120 ... tasks.
 // -m data/cube_12_hex.mesh  -pt 322 for 12 / 96 / 768 / 6144 ... tasks.
-
+// Example runs:
+// mpirun -np 10 ./laghos -p 0 -dim 3 -rs 1 -rp 2 -tf 0.08 -pa -visit -iv -diag output.txt -mach 0.28 -u0 1.0 -s 7 -fv -Re 100 -cfl 0.2
+// mpirun -np 8 ./laghos -p 0 -dim 3 -rs 1 -rp 2 -tf 0.3 -pa -visit -iv -diag output.txt -mach 0.28 -u0 1.0 -s 7 -fv -Re 200 -cfl 0.5 --interp-cycle 1
+#include <cstdlib>
 #include <fstream>
+#include <iomanip>
+#include <memory>
+#include <sstream>
+#include <string>
 #include <sys/time.h>
 #include <sys/resource.h>
 #include "laghos_solver.hpp"
 
 using std::cout;
+using std::cerr;
 using std::endl;
 using namespace mfem;
 
@@ -85,6 +93,18 @@ static long GetMaxRssMB();
 static void display_banner(std::ostream&);
 static void Checks(const int ti, const double norm, int &checks);
 static double ComputeEnstrophy(const ParGridFunction &v_gf);
+static void SaveParallelMesh(const ParMesh &pmesh, const char *mesh_dir,
+                             const char *fname_base);
+
+ParGridFunction* InterpolateFieldPeriodic(ParMesh &src_mesh,
+                                          ParGridFunction &src_gf,
+                                          ParMesh &tar_mesh,
+                                          int fieldtype,
+                                          int order,
+                                          double Lx,
+                                          double Ly,
+                                          double Lz,
+                                          bool use_periodic);
 
 int main(int argc, char *argv[])
 {
@@ -113,6 +133,9 @@ int main(int argc, char *argv[])
    double ftz_tol = 0.0;
    int cg_max_iter = 300;
    int max_tsteps = -1;
+   int interp_cycle = 0;
+   double interp_dt = 0.0;
+   const char *interp_mesh_dir = "interp_mesh";
    bool p_assembly = true;
    bool impose_visc = false;
    bool fixed_viscosity = false;
@@ -168,6 +191,12 @@ int main(int argc, char *argv[])
                   "Maximum number of CG iterations (velocity linear solve).");
    args.AddOption(&max_tsteps, "-ms", "--max-steps",
                   "Maximum number of steps (negative means no restriction).");
+   args.AddOption(&interp_cycle, "-ic", "--interp-cycle",
+                  "Remap every N cycles (0 disables).");
+   args.AddOption(&interp_dt, "-it", "--interp-time",
+                  "Remap every time interval (0 disables).");
+   args.AddOption(&interp_mesh_dir, "-imd", "--interp-mesh-dir",
+                  "Directory for saving the initial mesh partitions.");
    args.AddOption(&p_assembly, "-pa", "--partial-assembly", "-fa",
                   "--full-assembly",
                   "Activate 1D tensor-based assembly (partial assembly).");
@@ -232,6 +261,38 @@ int main(int argc, char *argv[])
       return 1;
    }
    if (Mpi::Root()) { args.PrintOptions(cout); }
+
+   const bool interp_cycle_on = interp_cycle > 0;
+   const bool interp_time_on = interp_dt > 0.0;
+   if (interp_cycle < 0 || interp_dt < 0.0)
+   {
+      if (Mpi::Root())
+      {
+         cerr << "Interpolation options must be non-negative." << endl;
+      }
+      return 1;
+   }
+   if (interp_cycle_on && interp_time_on)
+   {
+      if (Mpi::Root())
+      {
+         cerr << "Choose only one interpolation trigger: "
+                 "--interp-cycle or --interp-time." << endl;
+      }
+      return 1;
+   }
+   const bool interp_enabled = interp_cycle_on || interp_time_on;
+#ifndef MFEM_USE_GSLIB
+   if (interp_enabled)
+   {
+      if (Mpi::Root())
+      {
+         cerr << "Interpolation requires MFEM built with GSLIB "
+                 "(MFEM_USE_GSLIB=YES)." << endl;
+      }
+      return 1;
+   }
+#endif
 
    // Configure the device from the command line options
    Device backend;
@@ -527,6 +588,7 @@ int main(int argc, char *argv[])
    // compute the density values given the current mesh position, using the
    // property of pointwise mass conservation.
    ParGridFunction x_gf, v_gf, e_gf;
+   ParGridFunction x0_gf(&H1FESpace);
    x_gf.MakeRef(&H1FESpace, S, offset[0]);
    v_gf.MakeRef(&H1FESpace, S, offset[1]);
    e_gf.MakeRef(&L2FESpace, S, offset[2]);
@@ -535,6 +597,11 @@ int main(int argc, char *argv[])
    pmesh->SetNodalGridFunction(&x_gf);
    // Sync the data location of x_gf with its base, S
    x_gf.SyncAliasMemory(S);
+   x0_gf = x_gf;
+   if (interp_enabled)
+   {
+      SaveParallelMesh(*pmesh, interp_mesh_dir, "initial_mesh");
+   }
 
    // Initialize the velocity.
    VectorFunctionCoefficient v_coeff(pmesh->Dimension(), v0);
@@ -580,11 +647,11 @@ int main(int argc, char *argv[])
       }
    }
    ParGridFunction rho0_gf(&L2FESpace);
-   FunctionCoefficient rho0_coeff(rho0);
+   FunctionCoefficient rho0_func_coeff(rho0);
    L2_FECollection l2_fec(order_e, pmesh->Dimension());
    ParFiniteElementSpace l2_fes(pmesh, &l2_fec);
    ParGridFunction l2_rho0_gf(&l2_fes), l2_e(&l2_fes);
-   l2_rho0_gf.ProjectCoefficient(rho0_coeff);
+   l2_rho0_gf.ProjectCoefficient(rho0_func_coeff);
    rho0_gf.ProjectGridFunction(l2_rho0_gf);
    if (problem == 1)
    {
@@ -601,6 +668,8 @@ int main(int argc, char *argv[])
    e_gf.ProjectGridFunction(l2_e);
    // Sync the data location of e_gf with its base, S
    e_gf.SyncAliasMemory(S);
+
+   GridFunctionCoefficient rho0_coeff(&rho0_gf);
 
    // Piecewise constant ideal gas coefficient over the Lagrangian mesh. The
    // gamma values are projected on function that's constant on the moving mesh.
@@ -645,23 +714,24 @@ int main(int argc, char *argv[])
       viscosity_const = -1.0;
    }
 
-   hydrodynamics::LagrangianHydroOperator hydro(S.Size(),
-                                                H1FESpace, L2FESpace, ess_tdofs,
-                                                rho0_coeff, rho0_gf,
-                                                mat_gf, source, cfl,
-                                                visc, vorticity, viscosity_const,
-                                                p_assembly,
-                                                cg_tol, cg_max_iter, ftz_tol,
-                                                order_q);
+   auto hydro = std::make_unique<hydrodynamics::LagrangianHydroOperator>(
+      S.Size(),
+      H1FESpace, L2FESpace, ess_tdofs,
+      rho0_coeff, rho0_gf,
+      mat_gf, source, cfl,
+      visc, vorticity, viscosity_const,
+      p_assembly,
+      cg_tol, cg_max_iter, ftz_tol,
+      order_q);
 
    socketstream vis_rho, vis_v, vis_e;
    char vishost[] = "localhost";
    int  visport   = 19916;
 
    ParGridFunction rho_gf;
-   if (visualization || visit) { hydro.ComputeDensity(rho_gf); }
-   const double energy_init = hydro.InternalEnergy(e_gf) +
-                              hydro.KineticEnergy(v_gf);
+   if (visualization || visit) { hydro->ComputeDensity(rho_gf); }
+   const double energy_init = hydro->InternalEnergy(e_gf) +
+                              hydro->KineticEnergy(v_gf);
 
    if (visualization)
    {
@@ -721,9 +791,10 @@ int main(int argc, char *argv[])
    // Perform time-integration (looping over the time iterations, ti, with a
    // time-step dt). The object oper is of type LagrangianHydroOperator that
    // defines the Mult() method that used by the time integrators.
-   ode_solver->Init(hydro);
-   hydro.ResetTimeStepEstimate();
-   double t = 0.0, dt = hydro.GetTimeStepEstimate(S), t_old;
+   ode_solver->Init(*hydro);
+   hydro->ResetTimeStepEstimate();
+   double t = 0.0, dt = hydro->GetTimeStepEstimate(S), t_old;
+   double next_interp_time = interp_dt;
    bool last_step = false;
    int steps = 0;
    BlockVector S_old(S);
@@ -743,8 +814,8 @@ int main(int argc, char *argv[])
          MPI_Reduce(&mem, &msum, 1, MPI_LONG, MPI_SUM, 0, pmesh->GetComm());
          mem_gb = static_cast<double>(mmax) / 1024.0;
       }
-      const double internal_energy0 = hydro.InternalEnergy(e_gf);
-      const double kinetic_energy0 = hydro.KineticEnergy(v_gf);
+      const double internal_energy0 = hydro->InternalEnergy(e_gf);
+      const double kinetic_energy0 = hydro->KineticEnergy(v_gf);
       const double enstrophy0 = ComputeEnstrophy(v_gf);
       if (Mpi::Root())
       {
@@ -768,8 +839,8 @@ int main(int argc, char *argv[])
       }
    }
 
-   //   const double internal_energy = hydro.InternalEnergy(e_gf);
-   //   const double kinetic_energy = hydro.KineticEnergy(v_gf);
+   //   const double internal_energy = hydro->InternalEnergy(e_gf);
+   //   const double kinetic_energy = hydro->KineticEnergy(v_gf);
    //   if (mpi.Root())
    //   {
    //      cout << std::fixed;
@@ -799,7 +870,7 @@ int main(int argc, char *argv[])
       if (steps == max_tsteps) { last_step = true; }
       S_old = S;
       t_old = t;
-      hydro.ResetTimeStepEstimate();
+      hydro->ResetTimeStepEstimate();
 
       // S is the vector of dofs, t is the current time, and dt is the time step
       // to advance.
@@ -807,7 +878,7 @@ int main(int argc, char *argv[])
       steps++;
 
       // Adaptive time step control.
-      const double dt_est = hydro.GetTimeStepEstimate(S);
+      const double dt_est = hydro->GetTimeStepEstimate(S);
       if (dt_est < dt)
       {
          // Repeat (solve again) with a decreased time step - decrease of the
@@ -817,7 +888,7 @@ int main(int argc, char *argv[])
          { MFEM_ABORT("The time step crashed!"); }
          t = t_old;
          S = S_old;
-         hydro.ResetQuadratureData();
+         hydro->ResetQuadratureData();
          if (Mpi::Root()) { cout << "Repeating step " << ti << endl; }
          if (steps < max_tsteps) { last_step = false; }
          ti--; continue;
@@ -856,12 +927,12 @@ int main(int argc, char *argv[])
             MPI_Reduce(&mem, &mmax, 1, MPI_LONG, MPI_MAX, 0, pmesh->GetComm());
             MPI_Reduce(&mem, &msum, 1, MPI_LONG, MPI_SUM, 0, pmesh->GetComm());
          }
-         internal_energy = hydro.InternalEnergy(e_gf);
-         kinetic_energy = hydro.KineticEnergy(v_gf);
+         internal_energy = hydro->InternalEnergy(e_gf);
+         kinetic_energy = hydro->KineticEnergy(v_gf);
          // Compute work contributions over this timestep
-         total_work = hydro.ComputeTotalWork(v_gf, dt);
-         pressure_work = hydro.ComputePressureWork(v_gf, dt);
-         viscous_work = hydro.ComputeViscousWork(v_gf, dt);
+         total_work = hydro->ComputeTotalWork(v_gf, dt);
+         pressure_work = hydro->ComputePressureWork(v_gf, dt);
+         viscous_work = hydro->ComputeViscousWork(v_gf, dt);
          if (diag_output) { enstrophy = ComputeEnstrophy(v_gf); }
       }
       if (Mpi::Root())
@@ -906,11 +977,11 @@ int main(int argc, char *argv[])
             const double pressure_power = pressure_work * inv_dt;
             const double viscous_power = viscous_work * inv_dt;
             const double solve_total_power =
-               hydro.GetSolveEnergyTotalPower();
+               hydro->GetSolveEnergyTotalPower();
             const double solve_pressure_power =
-               hydro.GetSolveEnergyPressurePower();
+               hydro->GetSolveEnergyPressurePower();
             const double solve_viscous_power =
-               hydro.GetSolveEnergyViscousPower();
+               hydro->GetSolveEnergyViscousPower();
             diag_ofs << t << ","
                      << static_cast<double>(ti) << ","
                      << dt << ","
@@ -934,7 +1005,7 @@ int main(int argc, char *argv[])
          // another set of GLVis connections (one from each rank):
          MPI_Barrier(pmesh->GetComm());
 
-         if (visualization || visit || gfprint) { hydro.ComputeDensity(rho_gf); }
+         if (visualization || visit || gfprint) { hydro->ComputeDensity(rho_gf); }
          if (visualization)
          {
             int Wx = 0, Wy = 0; // window position
@@ -1008,6 +1079,73 @@ int main(int argc, char *argv[])
          MFEM_VERIFY(dim==2 || dim==3, "check: dimension");
          Checks(ti, e_norm, checks);
       }
+
+      if (interp_enabled)
+      {
+         bool do_remap = false;
+         if (interp_cycle_on && (ti % interp_cycle == 0)) { do_remap = true; }
+         if (interp_time_on && (t + 1.0e-12) >= next_interp_time)
+         {
+            do_remap = true;
+            while ((t + 1.0e-12) >= next_interp_time)
+            {
+               next_interp_time += interp_dt;
+            }
+         }
+
+         if (do_remap)
+         {
+            if (Mpi::Root())
+            {
+               cout << "Remap at step " << ti << ", t=" << t << endl;
+            }
+
+            ParMesh src_mesh(*pmesh);
+            ParMesh tar_mesh(*pmesh);
+            if (!tar_mesh.GetNodes())
+            {
+               tar_mesh.SetCurvature(order_v);
+            }
+            *tar_mesh.GetNodes() = x0_gf;
+
+            hydro->ComputeDensity(rho_gf);
+
+            std::unique_ptr<ParGridFunction> v_interp(
+               InterpolateFieldPeriodic(src_mesh, v_gf, tar_mesh,
+                                        0, order_v, 0.0, 0.0, 0.0, false));
+            std::unique_ptr<ParGridFunction> e_interp(
+               InterpolateFieldPeriodic(src_mesh, e_gf, tar_mesh,
+                                        1, order_e, 0.0, 0.0, 0.0, false));
+            std::unique_ptr<ParGridFunction> rho_interp(
+               InterpolateFieldPeriodic(src_mesh, rho_gf, tar_mesh,
+                                        1, order_e, 0.0, 0.0, 0.0, false));
+
+            x_gf = x0_gf;
+            x_gf.SyncAliasMemory(S);
+            pmesh->NewNodes(x_gf, false);
+
+            v_gf = *v_interp;
+            e_gf = *e_interp;
+            rho0_gf = *rho_interp;
+            v_gf.SyncAliasMemory(S);
+            e_gf.SyncAliasMemory(S);
+
+            mat_gf.ProjectCoefficient(mat_coeff);
+
+            hydro = std::make_unique<hydrodynamics::LagrangianHydroOperator>(
+               S.Size(),
+               H1FESpace, L2FESpace, ess_tdofs,
+               rho0_coeff, rho0_gf,
+               mat_gf, source, cfl,
+               visc, vorticity, viscosity_const,
+               p_assembly,
+               cg_tol, cg_max_iter, ftz_tol,
+               order_q);
+            ode_solver->Init(*hydro);
+            hydro->ResetTimeStepEstimate();
+            dt = hydro->GetTimeStepEstimate(S);
+         }
+      }
    }
    MFEM_VERIFY(!check || checks == 2, "Check error!");
 
@@ -1020,7 +1158,7 @@ int main(int argc, char *argv[])
       case 7: steps *= 2;
    }
 
-   hydro.PrintTimingData(Mpi::Root(), steps, fom);
+   hydro->PrintTimingData(Mpi::Root(), steps, fom);
 
    if (mem_usage)
    {
@@ -1029,8 +1167,8 @@ int main(int argc, char *argv[])
       MPI_Reduce(&mem, &msum, 1, MPI_LONG, MPI_SUM, 0, pmesh->GetComm());
    }
 
-   const double energy_final = hydro.InternalEnergy(e_gf) +
-                               hydro.KineticEnergy(v_gf);
+   const double energy_final = hydro->InternalEnergy(e_gf) +
+                               hydro->KineticEnergy(v_gf);
    if (Mpi::Root())
    {
       cout << endl;
@@ -1271,6 +1409,34 @@ static void display_banner(std::ostream &os)
       << "    / /___/ /_/ / /_/ / / / / /_/ (__  )    " << endl
       << "   /_____/\\__,_/\\__, /_/ /_/\\____/____/  " << endl
       << "               /____/                       " << endl << endl;
+}
+
+static void SaveParallelMesh(const ParMesh &pmesh, const char *mesh_dir,
+                             const char *fname_base)
+{
+   if (!mesh_dir || mesh_dir[0] == '\0') { return; }
+
+   if (Mpi::Root())
+   {
+      std::string cmd = std::string("mkdir -p ") + mesh_dir;
+      int ret = system(cmd.c_str());
+      MFEM_VERIFY(ret == 0, "Failed to create directory: " + std::string(mesh_dir));
+   }
+
+   MPI_Barrier(pmesh.GetComm());
+
+   std::ostringstream mesh_name;
+   mesh_name << mesh_dir << "/" << fname_base << "."
+             << std::setfill('0') << std::setw(6) << Mpi::WorldRank();
+
+   std::ofstream mesh_ofs(mesh_name.str().c_str());
+   MFEM_VERIFY(mesh_ofs.good(),
+               "Failed to open mesh file for writing: " + mesh_name.str());
+   mesh_ofs.precision(17);
+   pmesh.ParPrint(mesh_ofs);
+   mesh_ofs.close();
+
+   MPI_Barrier(pmesh.GetComm());
 }
 
 static long GetMaxRssMB()

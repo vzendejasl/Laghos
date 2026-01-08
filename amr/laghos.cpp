@@ -97,6 +97,8 @@ int main(int argc, char *argv[])
    double cg_tol = 1e-8;
    int cg_max_iter = 300;
    int max_tsteps = -1;
+   int interp_cycle = 0;
+   double interp_dt = 0.0;
    bool p_assembly = true;
    bool visualization = false;
    int vis_steps = 5;
@@ -138,6 +140,10 @@ int main(int argc, char *argv[])
                   "Maximum number of CG iterations (velocity linear solve).");
    args.AddOption(&max_tsteps, "-ms", "--max-steps",
                   "Maximum number of steps (negative means no restriction).");
+   args.AddOption(&interp_cycle, "-ic", "--interp-cycle",
+                  "Remap every N cycles (0 disables).");
+   args.AddOption(&interp_dt, "-it", "--interp-time",
+                  "Remap every time interval (0 disables).");
    args.AddOption(&p_assembly, "-pa", "--partial-assembly", "-fa",
                   "--full-assembly",
                   "Activate 1D tensor-based assembly (partial assembly).");
@@ -174,6 +180,35 @@ int main(int argc, char *argv[])
    if (!args.Good())
    {
       if (mpi.Root()) { args.PrintUsage(cout); }
+      return 1;
+   }
+
+   const bool interp_cycle_on = interp_cycle > 0;
+   const bool interp_time_on = interp_dt > 0.0;
+   if (interp_cycle < 0 || interp_dt < 0.0)
+   {
+      if (mpi.Root())
+      {
+         cerr << "Interpolation options must be non-negative." << endl;
+      }
+      return 1;
+   }
+   if (interp_cycle_on && interp_time_on)
+   {
+      if (mpi.Root())
+      {
+         cerr << "Choose only one interpolation trigger: "
+                 "--interp-cycle or --interp-time." << endl;
+      }
+      return 1;
+   }
+   if (interp_cycle_on || interp_time_on)
+   {
+      if (mpi.Root())
+      {
+         cerr << "Interpolation remap is only supported in the "
+                 "non-AMR Laghos miniapp." << endl;
+      }
       return 1;
    }
 
