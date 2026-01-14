@@ -221,6 +221,234 @@ void ComputeCurl(ParGridFunction &u, ParGridFunction &cu)
    }
 }
 
+void ComputeVortexTerms(ParGridFunction &u, ParGridFunction &w,
+                        ParGridFunction &w_stretch, ParGridFunction &w_compress)
+{
+   ParFiniteElementSpace *fes = u.ParFESpace();
+   ParFiniteElementSpace *wfes = w_stretch.ParFESpace();
+   int dim = fes->GetMesh()->Dimension();
+   int vdim = wfes->GetVDim();
+
+   u.HostRead();
+   w.HostRead();
+   w_stretch.HostReadWrite();
+   w_compress.HostReadWrite();
+
+   w_stretch = 0.0;
+   w_compress = 0.0;
+
+   Array<int> zones_per_vdof;
+   zones_per_vdof.SetSize(wfes->GetVSize());
+   zones_per_vdof = 0;
+
+   int elndofs;
+   Array<int> vdofs;
+   DenseMatrix grad_u;
+   Vector w_val, stretch_val, compress_val;
+   double div_u;
+
+   for (int e = 0; e < fes->GetNE(); ++e)
+   {
+      wfes->GetElementVDofs(e, vdofs);
+      ElementTransformation *tr = fes->GetElementTransformation(e);
+      const FiniteElement *el = fes->GetFE(e);
+      elndofs = el->GetDof();
+
+      for (int dof = 0; dof < elndofs; ++dof)
+      {
+         const IntegrationPoint &ip = el->GetNodes().IntPoint(dof);
+         tr->SetIntPoint(&ip);
+
+         u.GetVectorGradient(*tr, grad_u);
+         div_u = u.GetDivergence(*tr);
+
+         if (dim == 2)
+         {
+             double w_scalar = w.GetValue(*tr);
+             double val_compress = -1.0 * w_scalar * div_u;
+
+             int ldof = vdofs[dof];
+             w_stretch(ldof) += 0.0;
+             w_compress(ldof) += val_compress;
+             zones_per_vdof[ldof]++;
+         }
+         else
+         {
+             w.GetVectorValue(*tr, ip, w_val);
+
+             stretch_val.SetSize(3);
+             grad_u.Mult(w_val, stretch_val);
+
+             compress_val.SetSize(3);
+             compress_val = w_val;
+             compress_val *= -div_u;
+
+             bool by_nodes = (wfes->GetOrdering() == Ordering::byNODES);
+             for (int j = 0; j < vdim; ++j)
+             {
+                 int ldof = by_nodes ? vdofs[j*elndofs + dof] : vdofs[dof*vdim + j];
+                 w_stretch(ldof) += stretch_val(j);
+                 w_compress(ldof) += compress_val(j);
+                 zones_per_vdof[ldof]++;
+             }
+         }
+      }
+   }
+
+   GroupCommunicator &gcomm = wfes->GroupComm();
+   gcomm.Reduce<int>(zones_per_vdof, GroupCommunicator::Sum);
+   gcomm.Bcast<int>(zones_per_vdof);
+
+   gcomm.Reduce<double>(w_stretch.GetData(), GroupCommunicator::Sum);
+   gcomm.Bcast<double>(w_stretch.GetData());
+
+   gcomm.Reduce<double>(w_compress.GetData(), GroupCommunicator::Sum);
+   gcomm.Bcast<double>(w_compress.GetData());
+
+   for (int i = 0; i < zones_per_vdof.Size(); i++)
+   {
+      const int nz = zones_per_vdof[i];
+      if (nz)
+      {
+         w_stretch(i) /= nz;
+         w_compress(i) /= nz;
+      }
+   }
+}
+
+void ProjectL2toH1(ParGridFunction &l2_func, ParGridFunction &h1_func)
+{
+   ParFiniteElementSpace *h1_fes = h1_func.ParFESpace();
+
+   l2_func.HostRead();
+   h1_func.HostReadWrite();
+
+   h1_func = 0.0;
+
+   Array<int> zones_per_vdof;
+   zones_per_vdof.SetSize(h1_fes->GetVSize());
+   zones_per_vdof = 0;
+
+   Array<int> vdofs;
+
+   for (int e = 0; e < h1_fes->GetNE(); ++e)
+   {
+      h1_fes->GetElementVDofs(e, vdofs);
+      ElementTransformation *tr = h1_fes->GetElementTransformation(e);
+      const FiniteElement *el = h1_fes->GetFE(e);
+      int elndofs = el->GetDof();
+
+      for (int dof = 0; dof < elndofs; ++dof)
+      {
+         const IntegrationPoint &ip = el->GetNodes().IntPoint(dof);
+         tr->SetIntPoint(&ip);
+
+         double val = l2_func.GetValue(*tr);
+
+         h1_func(vdofs[dof]) += val;
+         zones_per_vdof[vdofs[dof]]++;
+      }
+   }
+
+   GroupCommunicator &gcomm = h1_fes->GroupComm();
+   gcomm.Reduce<int>(zones_per_vdof, GroupCommunicator::Sum);
+   gcomm.Bcast<int>(zones_per_vdof);
+
+   gcomm.Reduce<double>(h1_func.GetData(), GroupCommunicator::Sum);
+   gcomm.Bcast<double>(h1_func.GetData());
+
+   for (int i = 0; i < zones_per_vdof.Size(); i++)
+   {
+      if (zones_per_vdof[i])
+      {
+         h1_func(i) /= zones_per_vdof[i];
+      }
+   }
+}
+
+void ComputeBaroclinicTerm(ParGridFunction &rho_h1, ParGridFunction &e_h1,
+                           ParGridFunction &w_baroclinic)
+{
+   ParFiniteElementSpace *h1_fes = rho_h1.ParFESpace();
+   ParFiniteElementSpace *wfes = w_baroclinic.ParFESpace();
+
+   rho_h1.HostRead();
+   e_h1.HostRead();
+   w_baroclinic.HostReadWrite();
+
+   int dim = h1_fes->GetMesh()->Dimension();
+
+   w_baroclinic = 0.0;
+
+   Array<int> zones_per_vdof;
+   zones_per_vdof.SetSize(wfes->GetVSize());
+   zones_per_vdof = 0;
+
+   Array<int> vdofs;
+   Vector grad_rho, grad_e;
+   Vector baro_val;
+
+   double gamma = 5.0/3.0;
+
+   for (int e = 0; e < h1_fes->GetNE(); ++e)
+   {
+      wfes->GetElementVDofs(e, vdofs);
+      ElementTransformation *tr = h1_fes->GetElementTransformation(e);
+      const FiniteElement *el = h1_fes->GetFE(e);
+      int elndofs = el->GetDof();
+
+      for (int dof = 0; dof < elndofs; ++dof)
+      {
+         const IntegrationPoint &ip = el->GetNodes().IntPoint(dof);
+         tr->SetIntPoint(&ip);
+
+         rho_h1.GetGradient(*tr, grad_rho);
+         e_h1.GetGradient(*tr, grad_e);
+
+         double rho_val = rho_h1.GetValue(*tr);
+         double scale = (gamma - 1.0) / (rho_val + 1e-12);
+
+         if (dim == 2)
+         {
+             double cross_z = grad_rho(0) * grad_e(1) - grad_rho(1) * grad_e(0);
+             w_baroclinic(vdofs[dof]) += scale * cross_z;
+             zones_per_vdof[vdofs[dof]]++;
+         }
+         else
+         {
+             baro_val.SetSize(3);
+             baro_val(0) = grad_rho(1)*grad_e(2) - grad_rho(2)*grad_e(1);
+             baro_val(1) = grad_rho(2)*grad_e(0) - grad_rho(0)*grad_e(2);
+             baro_val(2) = grad_rho(0)*grad_e(1) - grad_rho(1)*grad_e(0);
+
+             baro_val *= scale;
+
+             bool by_nodes = (wfes->GetOrdering() == Ordering::byNODES);
+             int vdim_local = wfes->GetVDim();
+
+             for (int j = 0; j < vdim_local; ++j)
+             {
+                 int ldof = by_nodes ? vdofs[j*elndofs + dof] : vdofs[dof*vdim_local + j];
+                 w_baroclinic(ldof) += baro_val(j);
+                 zones_per_vdof[ldof]++;
+             }
+         }
+      }
+   }
+
+   GroupCommunicator &gcomm = wfes->GroupComm();
+   gcomm.Reduce<int>(zones_per_vdof, GroupCommunicator::Sum);
+   gcomm.Bcast<int>(zones_per_vdof);
+
+   gcomm.Reduce<double>(w_baroclinic.GetData(), GroupCommunicator::Sum);
+   gcomm.Bcast<double>(w_baroclinic.GetData());
+
+   for (int i = 0; i < zones_per_vdof.Size(); i++)
+   {
+      if (zones_per_vdof[i]) w_baroclinic(i) /= zones_per_vdof[i];
+   }
+}
+
 int main(int argc, char *argv[])
 {
    // Initialize MPI.
@@ -705,6 +933,12 @@ int main(int argc, char *argv[])
    // property of pointwise mass conservation.
    ParGridFunction x_gf, v_gf, e_gf;
    ParGridFunction w_gf; // Vorticity
+   ParGridFunction w_stretch, w_compress; // Vorticity Budget Terms
+   ParGridFunction w_baroclinic; // Baroclinic Torque
+   ParGridFunction w_viscous; // Viscous Terms (Torque + Interaction)
+   ParGridFunction rho_h1, e_h1; // Intermediate H1 fields for baroclinic term
+   ParGridFunction v_visc_gf; // Intermediate H1 field for viscous acceleration
+
    ParGridFunction x0_gf(&H1FESpace);
    x_gf.MakeRef(&H1FESpace, S, offset[0]);
    v_gf.MakeRef(&H1FESpace, S, offset[1]);
@@ -714,12 +948,31 @@ int main(int argc, char *argv[])
    if (dim == 2)
    {
       w_gf.SetSpace(&H1ScalarFESpace);
+      w_stretch.SetSpace(&H1ScalarFESpace);
+      w_compress.SetSpace(&H1ScalarFESpace);
+      w_baroclinic.SetSpace(&H1ScalarFESpace);
+      w_viscous.SetSpace(&H1ScalarFESpace);
    }
    else
    {
       w_gf.SetSpace(&H1FESpace);
+      w_stretch.SetSpace(&H1FESpace);
+      w_compress.SetSpace(&H1FESpace);
+      w_baroclinic.SetSpace(&H1FESpace);
+      w_viscous.SetSpace(&H1FESpace);
    }
    w_gf = 0.0;
+   w_stretch = 0.0;
+   w_compress = 0.0;
+   w_baroclinic = 0.0;
+   w_viscous = 0.0;
+
+   rho_h1.SetSpace(&H1ScalarFESpace);
+   e_h1.SetSpace(&H1ScalarFESpace);
+   rho_h1 = 0.0;
+   e_h1 = 0.0;
+   v_visc_gf.SetSpace(&H1FESpace);
+   v_visc_gf = 0.0;
 
    // Initialize x_gf using the starting mesh coordinates.
    pmesh->SetNodalGridFunction(&x_gf);
@@ -891,11 +1144,26 @@ int main(int argc, char *argv[])
    {
       // Compute Vorticity for t=0
       ComputeCurl(v_gf, w_gf);
+      ComputeVortexTerms(v_gf, w_gf, w_stretch, w_compress);
+
+      // ProjectL2toH1(rho_gf, rho_h1);
+      // ProjectL2toH1(e_gf, e_h1);
+      // ComputeBaroclinicTerm(rho_h1, e_h1, w_baroclinic);
+
+      // if (visc)
+      // {
+      //    hydro->ComputeViscousAcceleration(S, v_visc_gf);
+      //    ComputeCurl(v_visc_gf, w_viscous);
+      // }
 
       visit_dc.RegisterField("Density",  &rho_gf);
       visit_dc.RegisterField("Velocity", &v_gf);
       visit_dc.RegisterField("Specific Internal Energy", &e_gf);
       visit_dc.RegisterField("Vorticity", &w_gf);
+      visit_dc.RegisterField("VortexStretching", &w_stretch);
+      visit_dc.RegisterField("VortexCompression", &w_compress);
+      // visit_dc.RegisterField("BaroclinicTorque", &w_baroclinic);
+      // visit_dc.RegisterField("ViscousTorque", &w_viscous);
       visit_dc.SetCycle(0);
       visit_dc.SetTime(0.0);
       visit_dc.Save();
@@ -1143,6 +1411,17 @@ int main(int argc, char *argv[])
          if (visit)
          {
             ComputeCurl(v_gf, w_gf);
+            ComputeVortexTerms(v_gf, w_gf, w_stretch, w_compress);
+
+            // ProjectL2toH1(rho_gf, rho_h1);
+            // ProjectL2toH1(e_gf, e_h1);
+            // ComputeBaroclinicTerm(rho_h1, e_h1, w_baroclinic);
+
+            // if (visc)
+            // {
+            //    hydro->ComputeViscousAcceleration(S, v_visc_gf);
+            //    ComputeCurl(v_visc_gf, w_viscous);
+            // }
          }
 
          if (visualization)
@@ -1344,6 +1623,8 @@ int main(int argc, char *argv[])
    // Free the used memory.
    delete ode_solver;
    delete pmesh;
+
+   MPI_Finalize();
 
    return 0;
 }

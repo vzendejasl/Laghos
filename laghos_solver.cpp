@@ -163,17 +163,11 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    rhs_c_gf(&H1c),
    dvc_gf(&H1c)
 {
-
-   // Initialize new pressure and viscous tensors to zero for now
-   const int NQ = ir.GetNPoints();
-   for (int i = 0; i < NE * NQ; i++) {
-      for (int d1 = 0; d1 < dim; d1++) {
-         for (int d2 = 0; d2 < dim; d2++) {
-            qdata.pressureJinvT(i, d1, d2) = 0.0;
-            qdata.viscousJinvT(i, d1, d2) = 0.0;
-         }
-      }
-   }
+   // Initialize new pressure and viscous tensors to zero on device
+   Vector v_p(qdata.pressureJinvT.Data(), qdata.pressureJinvT.TotalSize());
+   Vector v_v(qdata.viscousJinvT.Data(), qdata.viscousJinvT.TotalSize());
+   v_p.UseDevice(true); v_p = 0.0;
+   v_v.UseDevice(true); v_v = 0.0;
 
 if (Mpi::Root()) {
    std::cout << "Sanity Check 1: QuadratureData structure" << std::endl;
@@ -862,18 +856,63 @@ double LagrangianHydroOperator::ComputePressureWork(const Vector &v, double dt) 
 double LagrangianHydroOperator::ComputeViscousWork(const Vector &v, double dt) const
 {
    Vector e_rhs_tau(L2Vsize), de_tau(L2Vsize);
-   
+
    // Compute viscous energy RHS and solve
    e_rhs_tau = 0.0;
    ForcePA_viscous->MultTranspose(v, e_rhs_tau);
    CG_EMass.Mult(e_rhs_tau, de_tau);
-   
+
    // Integrate to get power, multiply by dt for work
    const double viscous_power = IntegrateL2Field(de_tau);
    return viscous_power * dt;
 }
 
+void LagrangianHydroOperator::ComputeViscousAcceleration(const Vector &S, Vector &dv) const
+{
+   if (!p_assembly) { return; }
 
+   UpdateQuadratureData(S);
+
+   Vector one_l2(L2Vsize);
+   one_l2.UseDevice(true);
+   one_l2 = 1.0;
+
+   Vector rhs_visc(H1Vsize);
+   rhs_visc.UseDevice(true);
+   rhs_visc = 0.0;
+
+   ForcePA_viscous->Mult(one_l2, rhs_visc);
+
+   const int size = H1c.GetVSize();
+   const Operator *Pconf = H1c.GetProlongationMatrix();
+
+   dv.UseDevice(true);
+   dv.SetSize(H1Vsize);
+   dv = 0.0;
+
+   for (int c = 0; c < dim; c++)
+   {
+      Vector rhs_c(rhs_visc.GetData() + c*size, size);
+      Vector dvc(dv.GetData() + c*size, size);
+
+      Vector B_local, X_local;
+      B_local.UseDevice(true);
+      X_local.UseDevice(true);
+
+      if (Pconf) { Pconf->MultTranspose(rhs_c, B_local); }
+      else { B_local = rhs_c; }
+
+      X_local.SetSize(B_local.Size());
+      X_local = 0.0;
+
+      VMassPA->SetEssentialTrueDofs(c_tdofs[c]);
+      VMassPA->EliminateRHS(B_local);
+      CG_VMass.Mult(B_local, X_local);
+
+      if (Pconf) { Pconf->Mult(X_local, dvc); }
+      else { dvc = X_local; }
+   }
+}
 
 void LagrangianHydroOperator::PrintTimingData(bool IamRoot, int steps,
                                               const bool fom) const

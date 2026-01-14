@@ -214,6 +214,8 @@ public:
    double InternalEnergy(const ParGridFunction &e) const;
    double KineticEnergy(const ParGridFunction &v) const;
 
+   void ComputeViscousAcceleration(const Vector &S, Vector &dv) const;
+
    int GetH1VSize() const { return H1.GetVSize(); }
    const Array<int> &GetBlockOffsets() const { return block_offsets; }
 
