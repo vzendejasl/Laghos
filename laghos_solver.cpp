@@ -867,16 +867,121 @@ double LagrangianHydroOperator::ComputeViscousWork(const Vector &v, double dt) c
    return viscous_power * dt;
 }
 
+void LagrangianHydroOperator::ComputeWorkFields(const Vector &v,
+                                                ParGridFunction &work_p,
+                                                ParGridFunction &work_tau,
+                                                ParGridFunction &work_total) const
+{
+   if (!p_assembly) { return; }
+
+   // Compute Pressure energy RHS and solve for the field
+   e_rhs_p = 0.0;
+   ForcePA_pressure->MultTranspose(v, e_rhs_p);
+   CG_EMass.Mult(e_rhs_p, work_p);
+
+   // Compute Viscous energy RHS and solve for the field
+   e_rhs_tau = 0.0;
+   ForcePA_viscous->MultTranspose(v, e_rhs_tau);
+   CG_EMass.Mult(e_rhs_tau, work_tau);
+
+   // Compute Total energy RHS and solve for the field
+   e_rhs = 0.0;
+   ForcePA->MultTranspose(v, e_rhs);
+   CG_EMass.Mult(e_rhs, work_total);
+
+   // Debug: Integrate and print work rates
+   const double p_integral   = IntegrateL2Field(work_p);
+   const double tau_integral = IntegrateL2Field(work_tau);
+   const double tot_integral = IntegrateL2Field(work_total);
+
+   if (Mpi::Root())
+   {
+      std::cout.setf(std::ios::scientific);
+      std::cout.precision(6);
+      std::cout << "[Work-Verify] Pressure: " << p_integral
+                << ", Viscous: " << tau_integral
+                << ", Total: " << tot_integral
+                << ", Sum(P+V): " << (p_integral + tau_integral)
+                << ", Error: " << (tot_integral - (p_integral + tau_integral))
+                << std::endl;
+   }
+}
+
+void LagrangianHydroOperator::ComputeAcceleration(Vector &accel,
+                                                    Vector *accel_p,
+                                                    Vector *accel_tau) const
+{
+   if (!p_assembly) { return; }
+
+   // Helper lambda to solve M * a = F for a specific force operator
+   auto SolveComponent = [&](ForcePAOperator *F_op, Vector &output_accel)
+   {
+      Vector force_rhs(H1Vsize);
+      force_rhs.UseDevice(true);
+      
+      F_op->Mult(one, force_rhs);
+      force_rhs.Neg(); // Laghos convention: M du/dt = - Force(1)
+
+      const int size = H1c.GetVSize();
+      const Operator *Pconf = H1c.GetProlongationMatrix();
+      
+      for (int c = 0; c < dim; c++)
+      {
+         Vector rhs_c;
+         if (dim > 1) 
+         {
+             rhs_c.SetDataAndSize(force_rhs.GetData() + c*size, size);
+         }
+         else { rhs_c = force_rhs; }
+
+         Vector B_local(H1c.GetTrueVSize()), X_local(H1c.GetTrueVSize());
+         B_local.UseDevice(true); X_local.UseDevice(true);
+
+         if (Pconf) { Pconf->MultTranspose(rhs_c, B_local); }
+         else { B_local = rhs_c; }
+
+         X_local = 0.0; // Initial guess
+
+         VMassPA->SetEssentialTrueDofs(c_tdofs[c]);
+         VMassPA->EliminateRHS(B_local);
+         
+         CG_VMass.Mult(B_local, X_local);
+
+         Vector accel_c;
+         accel_c.SetDataAndSize(output_accel.GetData() + c*size, size);
+         
+         if (Pconf) { Pconf->Mult(X_local, accel_c); }
+         else { accel_c = X_local; }
+      }
+   };
+
+   // 1. Compute Total Acceleration
+   SolveComponent(ForcePA, accel);
+
+   // 2. Compute Pressure Acceleration (if requested)
+   if (accel_p)
+   {
+      SolveComponent(ForcePA_pressure, *accel_p);
+   }
+
+   // 3. Compute Viscous Acceleration (if requested)
+   if (accel_tau)
+   {
+      SolveComponent(ForcePA_viscous, *accel_tau);
+   }
+}
+
 void LagrangianHydroOperator::ComputeViscousAcceleration(const Vector &S, Vector &dv) const
 {
    if (!p_assembly) { return; }
 
    UpdateQuadratureData(S);
-
+   /*
    Vector one_l2(L2Vsize);
    one_l2.UseDevice(true);
    one_l2 = 1.0;
 
+   
    Vector rhs_visc(H1Vsize);
    rhs_visc.UseDevice(true);
    rhs_visc = 0.0;
@@ -890,6 +995,7 @@ void LagrangianHydroOperator::ComputeViscousAcceleration(const Vector &S, Vector
    dv.SetSize(H1Vsize);
    dv = 0.0;
 
+   
    for (int c = 0; c < dim; c++)
    {
       Vector rhs_c(rhs_visc.GetData() + c*size, size);
@@ -912,6 +1018,7 @@ void LagrangianHydroOperator::ComputeViscousAcceleration(const Vector &S, Vector
       if (Pconf) { Pconf->Mult(X_local, dvc); }
       else { dvc = X_local; }
    }
+      */
 }
 
 void LagrangianHydroOperator::PrintTimingData(bool IamRoot, int steps,

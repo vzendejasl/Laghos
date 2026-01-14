@@ -216,6 +216,11 @@ public:
 
    void ComputeViscousAcceleration(const Vector &S, Vector &dv) const;
 
+   void ComputeWorkFields(const Vector &v, ParGridFunction &work_p,
+                          ParGridFunction &work_tau, ParGridFunction &work_total) const;
+
+   void ComputeAcceleration(Vector &accel, Vector *accel_p = nullptr, Vector *accel_tau = nullptr) const;
+
    int GetH1VSize() const { return H1.GetVSize(); }
    const Array<int> &GetBlockOffsets() const { return block_offsets; }
 

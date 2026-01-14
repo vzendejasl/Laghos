@@ -116,6 +116,9 @@ ParGridFunction* InterpolateFieldPeriodic(ParMesh &src_mesh,
                                           double Lz,
                                           bool use_periodic);
 
+namespace Diagnostics
+{
+
 // Coefficient for 2D Vorticity (scalar)
 class VorticityCoefficient : public Coefficient
 {
@@ -221,8 +224,8 @@ void ComputeCurl(ParGridFunction &u, ParGridFunction &cu)
    }
 }
 
-void ComputeVortexTerms(ParGridFunction &u, ParGridFunction &w,
-                        ParGridFunction &w_stretch, ParGridFunction &w_compress)
+void ComputeVortexStretching(ParGridFunction &u, ParGridFunction &w,
+                             ParGridFunction &w_stretch)
 {
    ParFiniteElementSpace *fes = u.ParFESpace();
    ParFiniteElementSpace *wfes = w_stretch.ParFESpace();
@@ -232,10 +235,8 @@ void ComputeVortexTerms(ParGridFunction &u, ParGridFunction &w,
    u.HostRead();
    w.HostRead();
    w_stretch.HostReadWrite();
-   w_compress.HostReadWrite();
 
    w_stretch = 0.0;
-   w_compress = 0.0;
 
    Array<int> zones_per_vdof;
    zones_per_vdof.SetSize(wfes->GetVSize());
@@ -244,7 +245,84 @@ void ComputeVortexTerms(ParGridFunction &u, ParGridFunction &w,
    int elndofs;
    Array<int> vdofs;
    DenseMatrix grad_u;
-   Vector w_val, stretch_val, compress_val;
+   Vector w_val, stretch_val;
+
+   for (int e = 0; e < fes->GetNE(); ++e)
+   {
+      wfes->GetElementVDofs(e, vdofs);
+      ElementTransformation *tr = fes->GetElementTransformation(e);
+      const FiniteElement *el = fes->GetFE(e);
+      elndofs = el->GetDof();
+
+      for (int dof = 0; dof < elndofs; ++dof)
+      {
+         const IntegrationPoint &ip = el->GetNodes().IntPoint(dof);
+         tr->SetIntPoint(&ip);
+
+         if (dim == 3)
+         {
+             u.GetVectorGradient(*tr, grad_u);
+             w.GetVectorValue(*tr, ip, w_val);
+
+             stretch_val.SetSize(3);
+             grad_u.Mult(w_val, stretch_val);
+
+             bool by_nodes = (wfes->GetOrdering() == Ordering::byNODES);
+             for (int j = 0; j < vdim; ++j)
+             {
+                 int ldof = by_nodes ? vdofs[j*elndofs + dof] : vdofs[dof*vdim + j];
+                 w_stretch(ldof) += stretch_val(j);
+                 zones_per_vdof[ldof]++;
+             }
+         }
+         else
+         {
+             // 2D: Stretching is zero
+             int ldof = vdofs[dof];
+             w_stretch(ldof) += 0.0;
+             zones_per_vdof[ldof]++;
+         }
+      }
+   }
+
+   GroupCommunicator &gcomm = wfes->GroupComm();
+   gcomm.Reduce<int>(zones_per_vdof, GroupCommunicator::Sum);
+   gcomm.Bcast<int>(zones_per_vdof);
+
+   gcomm.Reduce<double>(w_stretch.GetData(), GroupCommunicator::Sum);
+   gcomm.Bcast<double>(w_stretch.GetData());
+
+   for (int i = 0; i < zones_per_vdof.Size(); i++)
+   {
+      const int nz = zones_per_vdof[i];
+      if (nz)
+      {
+         w_stretch(i) /= nz;
+      }
+   }
+}
+
+void ComputeVortexCompression(ParGridFunction &u, ParGridFunction &w,
+                              ParGridFunction &w_compress)
+{
+   ParFiniteElementSpace *fes = u.ParFESpace();
+   ParFiniteElementSpace *wfes = w_compress.ParFESpace();
+   int dim = fes->GetMesh()->Dimension();
+   int vdim = wfes->GetVDim();
+
+   u.HostRead();
+   w.HostRead();
+   w_compress.HostReadWrite();
+
+   w_compress = 0.0;
+
+   Array<int> zones_per_vdof;
+   zones_per_vdof.SetSize(wfes->GetVSize());
+   zones_per_vdof = 0;
+
+   int elndofs;
+   Array<int> vdofs;
+   Vector w_val, compress_val;
    double div_u;
 
    for (int e = 0; e < fes->GetNE(); ++e)
@@ -259,7 +337,6 @@ void ComputeVortexTerms(ParGridFunction &u, ParGridFunction &w,
          const IntegrationPoint &ip = el->GetNodes().IntPoint(dof);
          tr->SetIntPoint(&ip);
 
-         u.GetVectorGradient(*tr, grad_u);
          div_u = u.GetDivergence(*tr);
 
          if (dim == 2)
@@ -268,16 +345,12 @@ void ComputeVortexTerms(ParGridFunction &u, ParGridFunction &w,
              double val_compress = -1.0 * w_scalar * div_u;
 
              int ldof = vdofs[dof];
-             w_stretch(ldof) += 0.0;
              w_compress(ldof) += val_compress;
              zones_per_vdof[ldof]++;
          }
          else
          {
              w.GetVectorValue(*tr, ip, w_val);
-
-             stretch_val.SetSize(3);
-             grad_u.Mult(w_val, stretch_val);
 
              compress_val.SetSize(3);
              compress_val = w_val;
@@ -287,7 +360,6 @@ void ComputeVortexTerms(ParGridFunction &u, ParGridFunction &w,
              for (int j = 0; j < vdim; ++j)
              {
                  int ldof = by_nodes ? vdofs[j*elndofs + dof] : vdofs[dof*vdim + j];
-                 w_stretch(ldof) += stretch_val(j);
                  w_compress(ldof) += compress_val(j);
                  zones_per_vdof[ldof]++;
              }
@@ -299,9 +371,6 @@ void ComputeVortexTerms(ParGridFunction &u, ParGridFunction &w,
    gcomm.Reduce<int>(zones_per_vdof, GroupCommunicator::Sum);
    gcomm.Bcast<int>(zones_per_vdof);
 
-   gcomm.Reduce<double>(w_stretch.GetData(), GroupCommunicator::Sum);
-   gcomm.Bcast<double>(w_stretch.GetData());
-
    gcomm.Reduce<double>(w_compress.GetData(), GroupCommunicator::Sum);
    gcomm.Bcast<double>(w_compress.GetData());
 
@@ -310,7 +379,6 @@ void ComputeVortexTerms(ParGridFunction &u, ParGridFunction &w,
       const int nz = zones_per_vdof[i];
       if (nz)
       {
-         w_stretch(i) /= nz;
          w_compress(i) /= nz;
       }
    }
@@ -448,6 +516,292 @@ void ComputeBaroclinicTerm(ParGridFunction &rho_h1, ParGridFunction &e_h1,
       if (zones_per_vdof[i]) w_baroclinic(i) /= zones_per_vdof[i];
    }
 }
+
+void ComputeJacobian(ParMesh &pmesh,
+                     ParGridFunction &detJ_gf,
+                     ParGridFunction &logdetJ_gf,
+                     ParGridFunction &Jfrob_gf,
+                     ParGridFunction &Jinvfrob_gf,
+                     ParGridFunction &cond_gf,
+                     std::vector<ParGridFunction*> &Jcol_gf,
+                     int qorder,
+                     double det_eps = 1e-14)
+{
+   using namespace mfem;
+   const int dim = pmesh.Dimension();
+
+   QuadratureSpace qs(&pmesh, qorder);
+
+   // QuadratureFunctions for scalars
+   QuadratureFunction detJ_qf(&qs);
+   QuadratureFunction logdetJ_qf(&qs);
+   QuadratureFunction Jfrob_qf(&qs);
+   QuadratureFunction Jinvfrob_qf(&qs);
+   QuadratureFunction cond_qf(&qs);
+
+   detJ_qf = 0.0; logdetJ_qf = 0.0; Jfrob_qf = 0.0; Jinvfrob_qf = 0.0; cond_qf = 0.0;
+
+   // QuadratureFunctions for vector columns
+   // Use vdim = dim for vector fields
+   std::vector<QuadratureFunction*> Jcol_qf(dim);
+   for (int k = 0; k < dim; k++)
+   {
+      Jcol_qf[k] = new QuadratureFunction(&qs, dim);
+      *Jcol_qf[k] = 0.0;
+   }
+
+   DenseMatrix J(dim), Jinv(dim);
+   Vector col(dim);
+
+   // Flat iteration over quadrature points
+   // MFEM QuadratureFunctions are stored as (NE * NQ) or (NE * NQ * vdim)
+   // We iterate elements and local quad points to compute physics
+   int offset = 0;
+   
+   for (int e = 0; e < pmesh.GetNE(); e++)
+   {
+      ElementTransformation *T = pmesh.GetElementTransformation(e);
+      // We must use the integration rule from the QuadratureSpace to match indices
+      const IntegrationRule &ir = qs.GetIntRule(e);
+
+      for (int q = 0; q < ir.GetNPoints(); q++)
+      {
+         const IntegrationPoint &ip = ir.IntPoint(q);
+         T->SetIntPoint(&ip);
+
+         // Get Jacobian
+         J = T->Jacobian();
+         const double detJ = J.Det();
+         
+         // 1. detJ
+         detJ_qf[offset] = detJ;
+
+         // 2. Frobenius norm of J
+         double jf2 = 0.0;
+         for (int i = 0; i < dim; i++)
+            for (int k = 0; k < dim; k++)
+               jf2 += J(i,k)*J(i,k);
+         const double jf = std::sqrt(jf2);
+         Jfrob_qf[offset] = jf;
+
+         // 3. Columns of J as vectors
+         // QuadratureFunction vector layout is usually byVDIM: [q1_x, q2_x, ... q1_y, q2_y ...]
+         // But accessing via Vector view at index 'offset' handles strides if we use SetVectorValue?
+         // No, standard QuadratureFunction doesn't have SetVectorValue.
+         // We have to know the layout. By default, QuadratureFunction is standard Vector.
+         // If vdim > 1, it stores values physically sequentially?
+         // Actually, let's use the helper GetElementValues if possible, or manual.
+         // Manual flat index: values are usually ordered by (element, point, vdim) or (vdim, element, point)
+         // depending on ordering. QuadratureFunction default is typically (element, point) blocks.
+         // Let's assume standard VDof ordering for QuadratureFunction is (NE*NQ) blocks.
+         // Actually, VectorQuadratureFunction is not a standard class in older MFEM.
+         // Let's assume we map the QuadratureFunction which is just a Vector.
+         
+         // For vector QF, index i is (e*NQ + q) + component * (NE*NQ) usually? 
+         // Or interleaved?
+         // Safer approach: Use the ParGridFunction projection which handles everything!
+         // But we need to fill the QF first.
+         
+         // Let's assume standard ordering: data[ k * total_size + idx ]
+         // Actually, let's look at how we constructed it: QuadratureFunction(&qs, dim)
+         // The underlying storage is a Vector of size qs.GetSize() * dim.
+         // Access: qf( index * vdim + component ) if ordering is byNODES?
+         // No, QuadratureFunction doesn't support GetValue(element, ip).
+         
+         // Simple fix: Write directly to the data array if we know the layout.
+         // MFEM defaults: Ordering::byNODES (VDIM outer) or byVDIM (VDIM inner).
+         // QuadratureFunction uses byVDIM (interleaved) usually?
+         // Let's use a simpler approach: 
+         // We don't strictly *need* QuadratureFunctions for the vectors if we just want to project.
+         // But ProjectCoefficient takes a Coefficient.
+         
+         // Let's assume interleaved for now: [x1, y1, z1, x2, y2, z2...] for each point.
+         // int vec_offset = offset * dim;
+         
+         // Actually, let's check VectorQuadratureFunctionCoefficient. It expects a VectorQuadratureFunction.
+         // Since that class doesn't exist, we will use VectorGridFunctionCoefficient if we had a grid function.
+         
+         // Alternative: Implement a VectorCoefficient that evaluates J on the fly.
+         // This is MUCH cleaner and avoids QF layout guessing.
+         // I will switch to that approach for the columns below.
+         
+         // 4. log(detJ)
+         const double det_clamp = (detJ > det_eps) ? detJ : det_eps;
+         logdetJ_qf[offset] = std::log(det_clamp);
+
+         // 5. Inverse Frobenius
+         double jinvf = 0.0;
+         if (std::abs(detJ) > det_eps)
+         {
+            CalcInverse(J, Jinv);
+            double jinvf2 = 0.0;
+            for (int i = 0; i < dim; i++)
+               for (int k = 0; k < dim; k++)
+                  jinvf2 += Jinv(i,k)*Jinv(i,k);
+            jinvf = std::sqrt(jinvf2);
+         }
+         else
+         {
+            jinvf = 1.0 / det_eps;
+         }
+         Jinvfrob_qf[offset] = jinvf;
+         cond_qf[offset] = jf * jinvf;
+
+         offset++;
+      }
+   }
+
+   // Project scalars
+   {
+       QuadratureFunctionCoefficient c(detJ_qf);
+       detJ_gf.ProjectCoefficient(c);
+   }
+   {
+       QuadratureFunctionCoefficient c(logdetJ_qf);
+       logdetJ_gf.ProjectCoefficient(c);
+   }
+   {
+       QuadratureFunctionCoefficient c(Jfrob_qf);
+       Jfrob_gf.ProjectCoefficient(c);
+   }
+   {
+       QuadratureFunctionCoefficient c(Jinvfrob_qf);
+       Jinvfrob_gf.ProjectCoefficient(c);
+   }
+   {
+       QuadratureFunctionCoefficient c(cond_qf);
+       cond_gf.ProjectCoefficient(c);
+   }
+
+   // For columns, we define a small coefficient class locally
+   class JacobianColumnCoefficient : public VectorCoefficient
+   {
+   private:
+      int col_idx;
+   public:
+      JacobianColumnCoefficient(int dim, int col) 
+         : VectorCoefficient(dim), col_idx(col) {}
+         
+      virtual void Eval(Vector &V, ElementTransformation &T, 
+                        const IntegrationPoint &ip)
+      {
+         // Set the integration point first!
+         T.SetIntPoint(&ip);
+         // Get the Jacobian (MFEM returns const reference)
+         const DenseMatrix &Jlocal = T.Jacobian();
+         
+         int d = Jlocal.Height();
+         V.SetSize(d);
+         for(int i=0; i<d; i++) V(i) = Jlocal(i, col_idx);
+      }
+   };
+
+   for (int k = 0; k < dim; k++)
+   {
+      JacobianColumnCoefficient j_col_coeff(dim, k);
+      Jcol_gf[k]->ProjectCoefficient(j_col_coeff);
+      delete Jcol_qf[k];
+   }
+}
+
+void ComputeViscousBaroclinic(ParGridFunction &rho_h1, ParGridFunction &accel_tau,
+                              ParGridFunction &w_visc_baro)
+{
+   ParFiniteElementSpace *h1_fes = rho_h1.ParFESpace();
+   ParFiniteElementSpace *wfes = w_visc_baro.ParFESpace();
+
+   rho_h1.HostRead();
+   accel_tau.HostRead();
+   w_visc_baro.HostReadWrite();
+
+   int dim = h1_fes->GetMesh()->Dimension();
+
+   w_visc_baro = 0.0;
+
+   Array<int> zones_per_vdof;
+   zones_per_vdof.SetSize(wfes->GetVSize());
+   zones_per_vdof = 0;
+
+   Array<int> vdofs;
+   Vector grad_rho;
+   Vector a_val; 
+   Vector baro_val;
+
+   for (int e = 0; e < h1_fes->GetNE(); ++e)
+   {
+      wfes->GetElementVDofs(e, vdofs);
+      ElementTransformation *tr = h1_fes->GetElementTransformation(e);
+      const FiniteElement *el = h1_fes->GetFE(e);
+      int elndofs = el->GetDof();
+
+      for (int dof = 0; dof < elndofs; ++dof)
+      {
+         const IntegrationPoint &ip = el->GetNodes().IntPoint(dof);
+         tr->SetIntPoint(&ip);
+
+         rho_h1.GetGradient(*tr, grad_rho);
+         accel_tau.GetVectorValue(*tr, ip, a_val);
+
+         double rho_val = rho_h1.GetValue(*tr);
+         // Term is - (1/rho) * (grad_rho x a_visc)
+         double scale = -1.0 / (rho_val + 1e-12);
+
+         if (dim == 2)
+         {
+             // 2D Cross product (scalar result)
+             double cross_z = grad_rho(0) * a_val(1) - grad_rho(1) * a_val(0);
+             w_visc_baro(vdofs[dof]) += scale * cross_z;
+             zones_per_vdof[vdofs[dof]]++;
+         }
+         else
+         {
+             baro_val.SetSize(3);
+             baro_val(0) = grad_rho(1)*a_val(2) - grad_rho(2)*a_val(1);
+             baro_val(1) = grad_rho(2)*a_val(0) - grad_rho(0)*a_val(2);
+             baro_val(2) = grad_rho(0)*a_val(1) - grad_rho(1)*a_val(0);
+
+             baro_val *= scale;
+
+             bool by_nodes = (wfes->GetOrdering() == Ordering::byNODES);
+             int vdim_local = wfes->GetVDim();
+
+             for (int j = 0; j < vdim_local; ++j)
+             {
+                 int ldof = by_nodes ? vdofs[j*elndofs + dof] : vdofs[dof*vdim_local + j];
+                 w_visc_baro(ldof) += baro_val(j);
+                 zones_per_vdof[ldof]++;
+             }
+         }
+      }
+   }
+
+   GroupCommunicator &gcomm = wfes->GroupComm();
+   gcomm.Reduce<int>(zones_per_vdof, GroupCommunicator::Sum);
+   gcomm.Bcast<int>(zones_per_vdof);
+
+   gcomm.Reduce<double>(w_visc_baro.GetData(), GroupCommunicator::Sum);
+   gcomm.Bcast<double>(w_visc_baro.GetData());
+
+   for (int i = 0; i < zones_per_vdof.Size(); i++)
+   {
+      if (zones_per_vdof[i]) w_visc_baro(i) /= zones_per_vdof[i];
+   }
+}
+
+void ComputeViscousTorqueComponents(ParGridFunction &rho_h1, ParGridFunction &accel_tau,
+                                    ParGridFunction &w_visc_total,
+                                    ParGridFunction &w_visc_diff,
+                                    ParGridFunction &w_visc_baro)
+{
+   ComputeCurl(accel_tau, w_visc_total);
+   ComputeViscousBaroclinic(rho_h1, accel_tau, w_visc_baro);
+
+   // Diffusion = Total - Baroclinic
+   w_visc_diff = w_visc_total;
+   w_visc_diff.Add(-1.0, w_visc_baro);
+}
+
+} // namespace Diagnostics
 
 int main(int argc, char *argv[])
 {
@@ -935,7 +1289,11 @@ int main(int argc, char *argv[])
    ParGridFunction w_gf; // Vorticity
    ParGridFunction w_stretch, w_compress; // Vorticity Budget Terms
    ParGridFunction w_baroclinic; // Baroclinic Torque
-   ParGridFunction w_viscous; // Viscous Terms (Torque + Interaction)
+   ParGridFunction w_viscous; // Total Viscous Torque (Curl of a_visc)
+   ParGridFunction w_visc_diff, w_visc_baro; // Viscous Diffusion & Viscous Baroclinic
+   ParGridFunction work_p, work_tau, work_total; // Work Diagnostic Fields
+   ParGridFunction accel_gf; // Acceleration Field (RHS of Momentum)
+   ParGridFunction accel_p, accel_tau; // Components of Acceleration
    ParGridFunction rho_h1, e_h1; // Intermediate H1 fields for baroclinic term
    ParGridFunction v_visc_gf; // Intermediate H1 field for viscous acceleration
 
@@ -952,6 +1310,8 @@ int main(int argc, char *argv[])
       w_compress.SetSpace(&H1ScalarFESpace);
       w_baroclinic.SetSpace(&H1ScalarFESpace);
       w_viscous.SetSpace(&H1ScalarFESpace);
+      w_visc_diff.SetSpace(&H1ScalarFESpace);
+      w_visc_baro.SetSpace(&H1ScalarFESpace);
    }
    else
    {
@@ -960,12 +1320,30 @@ int main(int argc, char *argv[])
       w_compress.SetSpace(&H1FESpace);
       w_baroclinic.SetSpace(&H1FESpace);
       w_viscous.SetSpace(&H1FESpace);
+      w_visc_diff.SetSpace(&H1FESpace);
+      w_visc_baro.SetSpace(&H1FESpace);
    }
    w_gf = 0.0;
    w_stretch = 0.0;
    w_compress = 0.0;
    w_baroclinic = 0.0;
    w_viscous = 0.0;
+   w_visc_diff = 0.0;
+   w_visc_baro = 0.0;
+
+   work_p.SetSpace(&L2FESpace);
+   work_tau.SetSpace(&L2FESpace);
+   work_total.SetSpace(&L2FESpace);
+   work_p = 0.0;
+   work_tau = 0.0;
+   work_total = 0.0;
+
+   accel_gf.SetSpace(&H1FESpace);
+   accel_gf = 0.0;
+   accel_p.SetSpace(&H1FESpace);
+   accel_p = 0.0;
+   accel_tau.SetSpace(&H1FESpace);
+   accel_tau = 0.0;
 
    rho_h1.SetSpace(&H1ScalarFESpace);
    e_h1.SetSpace(&H1ScalarFESpace);
@@ -973,6 +1351,29 @@ int main(int argc, char *argv[])
    e_h1 = 0.0;
    v_visc_gf.SetSpace(&H1FESpace);
    v_visc_gf = 0.0;
+
+   // ---- Jacobian diagnostics fields ----
+   const int vis_order = order_v;
+   const int qorder    = 2*order_v; 
+
+   mfem::L2_FECollection vis_l2_fec(vis_order, dim);
+   mfem::ParFiniteElementSpace l2s_fes(pmesh, &vis_l2_fec);           // scalar
+   mfem::ParFiniteElementSpace l2v_fes(pmesh, &vis_l2_fec, dim);      // vector (vdim=dim)
+
+   // Scalars
+   mfem::ParGridFunction detJ_gf(&l2s_fes);
+   mfem::ParGridFunction logdetJ_gf(&l2s_fes);
+   mfem::ParGridFunction Jfrob_gf(&l2s_fes);
+   mfem::ParGridFunction Jinvfrob_gf(&l2s_fes);
+   mfem::ParGridFunction cond_gf(&l2s_fes);
+
+   // Vectors: J columns
+   std::vector<mfem::ParGridFunction*> Jcol_gf(dim);
+   for (int k = 0; k < dim; k++) { Jcol_gf[k] = new mfem::ParGridFunction(&l2v_fes); }
+
+   // init
+   detJ_gf = 0.0; logdetJ_gf = 0.0; Jfrob_gf = 0.0; Jinvfrob_gf = 0.0; cond_gf = 0.0;
+   for (int k = 0; k < dim; k++) { (*Jcol_gf[k]) = 0.0; }
 
    // Initialize x_gf using the starting mesh coordinates.
    pmesh->SetNodalGridFunction(&x_gf);
@@ -1140,15 +1541,31 @@ int main(int argc, char *argv[])
 
    // Save data for VisIt visualization.
    VisItDataCollection visit_dc(basename, pmesh);
+   VisItDataCollection visit_dc_debug("results_debug/Laghos", pmesh);
    if (visit)
    {
       // Compute Vorticity for t=0
-      ComputeCurl(v_gf, w_gf);
-      ComputeVortexTerms(v_gf, w_gf, w_stretch, w_compress);
+      Diagnostics::ComputeCurl(v_gf, w_gf);
+      Diagnostics::ComputeVortexStretching(v_gf, w_gf, w_stretch);
+      Diagnostics::ComputeVortexCompression(v_gf, w_gf, w_compress);
 
-      // ProjectL2toH1(rho_gf, rho_h1);
-      // ProjectL2toH1(e_gf, e_h1);
-      // ComputeBaroclinicTerm(rho_h1, e_h1, w_baroclinic);
+      Diagnostics::ProjectL2toH1(rho_gf, rho_h1);
+      Diagnostics::ProjectL2toH1(e_gf, e_h1);
+      Diagnostics::ComputeBaroclinicTerm(rho_h1, e_h1, w_baroclinic);
+      hydro->ComputeWorkFields(v_gf, work_p, work_tau, work_total);
+      hydro->ComputeAcceleration(accel_gf, &accel_p, &accel_tau);
+
+      if (visc)
+      {
+         Diagnostics::ComputeViscousTorqueComponents(rho_h1, accel_tau,
+                                                     w_viscous, w_visc_diff, w_visc_baro);
+      }
+
+      Diagnostics::ComputeJacobian(const_cast<ParMesh&>(*pmesh),
+                                      detJ_gf, logdetJ_gf,
+                                      Jfrob_gf, Jinvfrob_gf, cond_gf,
+                                      Jcol_gf,
+                                      qorder);
 
       // if (visc)
       // {
@@ -1160,13 +1577,42 @@ int main(int argc, char *argv[])
       visit_dc.RegisterField("Velocity", &v_gf);
       visit_dc.RegisterField("Specific Internal Energy", &e_gf);
       visit_dc.RegisterField("Vorticity", &w_gf);
-      visit_dc.RegisterField("VortexStretching", &w_stretch);
-      visit_dc.RegisterField("VortexCompression", &w_compress);
-      // visit_dc.RegisterField("BaroclinicTorque", &w_baroclinic);
-      // visit_dc.RegisterField("ViscousTorque", &w_viscous);
       visit_dc.SetCycle(0);
       visit_dc.SetTime(0.0);
       visit_dc.Save();
+
+      visit_dc_debug.RegisterField("Vorticity", &w_gf);
+      visit_dc_debug.RegisterField("VortexStretching", &w_stretch);
+      visit_dc_debug.RegisterField("VortexCompression", &w_compress);
+      visit_dc_debug.RegisterField("BaroclinicTorque", &w_baroclinic);
+      visit_dc_debug.RegisterField("WorkPressure", &work_p);
+      visit_dc_debug.RegisterField("WorkViscous", &work_tau);
+      visit_dc_debug.RegisterField("WorkTotal", &work_total);
+      visit_dc_debug.RegisterField("Acceleration", &accel_gf);
+      visit_dc_debug.RegisterField("AccelPressure", &accel_p);
+      visit_dc_debug.RegisterField("AccelViscous", &accel_tau);
+      
+      if (visc)
+      {
+         visit_dc_debug.RegisterField("ViscousTorqueTotal", &w_viscous);
+         visit_dc_debug.RegisterField("ViscousDiffusionVorticity", &w_visc_diff);
+         visit_dc_debug.RegisterField("ViscousBaroclinic", &w_visc_baro);
+      }
+
+      visit_dc_debug.RegisterField("detJ",      &detJ_gf);
+      visit_dc_debug.RegisterField("log_detJ",  &logdetJ_gf);
+      visit_dc_debug.RegisterField("J_Frob",    &Jfrob_gf);
+      visit_dc_debug.RegisterField("Jinv_Frob", &Jinvfrob_gf);
+      visit_dc_debug.RegisterField("cond_Frob", &cond_gf);
+
+      for (int k = 0; k < dim; k++)
+      {
+         visit_dc_debug.RegisterField(("J_col"+std::to_string(k)).c_str(), Jcol_gf[k]);
+      }
+
+      visit_dc_debug.SetCycle(0);
+      visit_dc_debug.SetTime(0.0);
+      visit_dc_debug.Save();
    }
    std::ofstream diag_ofs;
    const bool diag_output = (diag_file && diag_file[0] != '\0');
@@ -1410,12 +1856,39 @@ int main(int argc, char *argv[])
          // Compute Vorticity
          if (visit)
          {
-            ComputeCurl(v_gf, w_gf);
-            ComputeVortexTerms(v_gf, w_gf, w_stretch, w_compress);
+            Diagnostics::ComputeCurl(v_gf, w_gf);
+            Diagnostics::ComputeVortexStretching(v_gf, w_gf, w_stretch);
+            Diagnostics::ComputeVortexCompression(v_gf, w_gf, w_compress);
 
-            // ProjectL2toH1(rho_gf, rho_h1);
-            // ProjectL2toH1(e_gf, e_h1);
-            // ComputeBaroclinicTerm(rho_h1, e_h1, w_baroclinic);
+            Diagnostics::ProjectL2toH1(rho_gf, rho_h1);
+            Diagnostics::ProjectL2toH1(e_gf, e_h1);
+            Diagnostics::ComputeBaroclinicTerm(rho_h1, e_h1, w_baroclinic);
+            hydro->ComputeWorkFields(v_gf, work_p, work_tau, work_total);
+            hydro->ComputeAcceleration(accel_gf, &accel_p, &accel_tau);
+
+            if (visc)
+            {
+               Diagnostics::ComputeViscousTorqueComponents(rho_h1, accel_tau,
+                                                           w_viscous, w_visc_diff, w_visc_baro);
+            }
+
+            Diagnostics::ComputeJacobian(const_cast<ParMesh&>(*pmesh),
+                                            detJ_gf, logdetJ_gf,
+                                            Jfrob_gf, Jinvfrob_gf, cond_gf,
+                                            Jcol_gf,
+                                            qorder);
+
+            // Verification: Check if accel_total == accel_p + accel_tau
+            ParGridFunction accel_diff(accel_gf); // Initialize with Total
+            accel_diff.Add(-1.0, accel_p);        // Subtract Pressure
+            accel_diff.Add(-1.0, accel_tau);      // Subtract Viscous
+            double accel_err = accel_diff.Norml2();
+            
+            if (Mpi::Root())
+            {
+               std::cout << "[Accel-Verify] || a_total - (a_p + a_tau) ||_L2 = " 
+                         << accel_err << std::endl;
+            }
 
             // if (visc)
             // {
@@ -1449,6 +1922,17 @@ int main(int argc, char *argv[])
             visit_dc.SetCycle(ti);
             visit_dc.SetTime(t);
             visit_dc.Save();
+
+            if (visc)
+            {
+               visit_dc_debug.RegisterField("ViscousTorqueTotal", &w_viscous);
+               visit_dc_debug.RegisterField("ViscousDiffusionVorticity", &w_visc_diff);
+               visit_dc_debug.RegisterField("ViscousBaroclinic", &w_visc_baro);
+            }
+
+            visit_dc_debug.SetCycle(ti);
+            visit_dc_debug.SetTime(t);
+            visit_dc_debug.Save();
          }
 
          if (gfprint)
