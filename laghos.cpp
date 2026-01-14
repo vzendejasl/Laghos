@@ -106,6 +106,121 @@ ParGridFunction* InterpolateFieldPeriodic(ParMesh &src_mesh,
                                           double Lz,
                                           bool use_periodic);
 
+ParGridFunction* InterpolateFieldPeriodic(ParMesh &src_mesh,
+                                          ParGridFunction &src_gf,
+                                          ParMesh &tar_mesh,
+                                          int fieldtype,
+                                          int order,
+                                          double Lx,
+                                          double Ly,
+                                          double Lz,
+                                          bool use_periodic);
+
+// Coefficient for 2D Vorticity (scalar)
+class VorticityCoefficient : public Coefficient
+{
+protected:
+   ParGridFunction *v_gf;
+public:
+   VorticityCoefficient(ParGridFunction *v_gf_) : v_gf(v_gf_) { }
+   virtual double Eval(ElementTransformation &T, const IntegrationPoint &ip)
+   {
+      Vector curl(1);
+      v_gf->GetCurl(T, curl);
+      return curl(0);
+   }
+};
+
+// Coefficient for 3D Vorticity (vector)
+class VorticityVectorCoefficient : public VectorCoefficient
+{
+protected:
+   ParGridFunction *v_gf;
+public:
+   VorticityVectorCoefficient(int dim, ParGridFunction *v_gf_)
+      : VectorCoefficient(dim), v_gf(v_gf_) { }
+   virtual void Eval(Vector &V, ElementTransformation &T,
+                     const IntegrationPoint &ip)
+   {
+      v_gf->GetCurl(T, V);
+   }
+};
+
+void ComputeCurl(ParGridFunction &u, ParGridFunction &cu)
+{
+   ParFiniteElementSpace *fes = u.ParFESpace();
+   ParFiniteElementSpace *cfes = cu.ParFESpace();
+   int dim = fes->GetMesh()->Dimension();
+   int vdim = cfes->GetVDim(); // 1 for 2D, 3 for 3D
+
+   // AccumulateAndCountZones.
+   Array<int> zones_per_vdof;
+   zones_per_vdof.SetSize(cfes->GetVSize());
+   zones_per_vdof = 0;
+
+   cu = 0.0;
+
+   // Local interpolation.
+   int elndofs;
+   Array<int> vdofs;
+   Vector curl(dim == 3 ? 3 : 1);
+
+   for (int e = 0; e < fes->GetNE(); ++e)
+   {
+      cfes->GetElementVDofs(e, vdofs); // Get vdofs for result
+      ElementTransformation *tr = fes->GetElementTransformation(e);
+      const FiniteElement *el = fes->GetFE(e);
+      elndofs = el->GetDof();
+
+      for (int dof = 0; dof < elndofs; ++dof)
+      {
+         // Project.
+         const IntegrationPoint &ip = el->GetNodes().IntPoint(dof);
+         tr->SetIntPoint(&ip);
+
+         u.GetCurl(*tr, curl);
+
+         if (dim == 2)
+         {
+             // 2D: curl is scalar (1 component), cu is scalar
+             int ldof = vdofs[dof];
+             cu(ldof) += curl(0);
+             zones_per_vdof[ldof]++;
+         }
+         else
+         {
+             // 3D: curl is vector (3 components), cu is vector
+             // Check ordering. ParFiniteElementSpace default is byNODES
+             bool by_nodes = (cfes->GetOrdering() == Ordering::byNODES);
+             for (int j = 0; j < vdim; ++j)
+             {
+                 int ldof = by_nodes ? vdofs[j*elndofs + dof] : vdofs[dof*vdim + j];
+                 cu(ldof) += curl(j);
+                 zones_per_vdof[ldof]++;
+             }
+         }
+      }
+   }
+
+   // Communication
+   GroupCommunicator &gcomm = cfes->GroupComm();
+   gcomm.Reduce<int>(zones_per_vdof, GroupCommunicator::Sum);
+   gcomm.Bcast<int>(zones_per_vdof);
+
+   gcomm.Reduce<double>(cu.GetData(), GroupCommunicator::Sum);
+   gcomm.Bcast<double>(cu.GetData());
+
+   // Compute means.
+   for (int i = 0; i < cu.Size(); i++)
+   {
+      const int nz = zones_per_vdof[i];
+      if (nz)
+      {
+         cu(i) /= nz;
+      }
+   }
+}
+
 int main(int argc, char *argv[])
 {
    // Initialize MPI.
@@ -521,6 +636,7 @@ int main(int argc, char *argv[])
    H1_FECollection H1FEC(order_v, dim);
    ParFiniteElementSpace L2FESpace(pmesh, &L2FEC);
    ParFiniteElementSpace H1FESpace(pmesh, &H1FEC, pmesh->Dimension());
+   ParFiniteElementSpace H1ScalarFESpace(pmesh, &H1FEC); // For 2D vorticity
 
    // Boundary conditions: all tests use v.n = 0 on the boundary, and we assume
    // that the boundaries are straight.
@@ -588,10 +704,22 @@ int main(int argc, char *argv[])
    // compute the density values given the current mesh position, using the
    // property of pointwise mass conservation.
    ParGridFunction x_gf, v_gf, e_gf;
+   ParGridFunction w_gf; // Vorticity
    ParGridFunction x0_gf(&H1FESpace);
    x_gf.MakeRef(&H1FESpace, S, offset[0]);
    v_gf.MakeRef(&H1FESpace, S, offset[1]);
    e_gf.MakeRef(&L2FESpace, S, offset[2]);
+
+   // Initialize vorticity grid function
+   if (dim == 2)
+   {
+      w_gf.SetSpace(&H1ScalarFESpace);
+   }
+   else
+   {
+      w_gf.SetSpace(&H1FESpace);
+   }
+   w_gf = 0.0;
 
    // Initialize x_gf using the starting mesh coordinates.
    pmesh->SetNodalGridFunction(&x_gf);
@@ -761,9 +889,13 @@ int main(int argc, char *argv[])
    VisItDataCollection visit_dc(basename, pmesh);
    if (visit)
    {
+      // Compute Vorticity for t=0
+      ComputeCurl(v_gf, w_gf);
+
       visit_dc.RegisterField("Density",  &rho_gf);
       visit_dc.RegisterField("Velocity", &v_gf);
       visit_dc.RegisterField("Specific Internal Energy", &e_gf);
+      visit_dc.RegisterField("Vorticity", &w_gf);
       visit_dc.SetCycle(0);
       visit_dc.SetTime(0.0);
       visit_dc.Save();
@@ -1006,6 +1138,13 @@ int main(int argc, char *argv[])
          MPI_Barrier(pmesh->GetComm());
 
          if (visualization || visit || gfprint) { hydro->ComputeDensity(rho_gf); }
+         
+         // Compute Vorticity
+         if (visit)
+         {
+            ComputeCurl(v_gf, w_gf);
+         }
+
          if (visualization)
          {
             int Wx = 0, Wy = 0; // window position
