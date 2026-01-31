@@ -1706,6 +1706,25 @@ int main(int argc, char *argv[])
    //      }
    //      cout << endl;
    //   }
+
+   std::ofstream csv_ofs;
+   if (Mpi::Root())
+   {
+      csv_ofs.open("laghos_thermo.csv");
+      csv_ofs << "                    Time,"
+              << "                   Cycle,"
+              << "      PressureDilatation,"
+              << "      ViscousDissipation,"
+              << "                 rho_avg,"
+              << "                temp_avg,"
+              << "                 rho_rms,"
+              << "                temp_rms,"
+              << "               div_u_rms,"
+              << "                  cs_rms" << std::endl;
+      csv_ofs.precision(16);
+      csv_ofs << std::scientific;
+   }
+
    for (int ti = 1; !last_step; ti++)
    {
       if (t + dt >= t_final)
@@ -1814,6 +1833,32 @@ int main(int argc, char *argv[])
                  << ", verification=" << (total_work - (pressure_work + viscous_work))
                  << endl;
          }
+      }
+
+      if (log_step)
+      {
+         double vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms;
+         hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms);
+         if (Mpi::Root())
+         {
+            const double p_dil = hydro->GetSolveEnergyPressurePower();
+            const double v_dis = hydro->GetSolveEnergyViscousPower();
+
+            csv_ofs << std::setw(24) << t << ", "
+                    << std::setw(24) << static_cast<double>(ti) << ", "
+                    << std::setw(24) << p_dil << ", "
+                    << std::setw(24) << v_dis << ", "
+                    << std::setw(24) << r_avg << ", "
+                    << std::setw(24) << t_avg << ", "
+                    << std::setw(24) << r_rms << ", "
+                    << std::setw(24) << t_rms << ", "
+                    << std::setw(24) << d_rms << ", "
+                    << std::setw(24) << c_rms << std::endl;
+         }
+      }
+
+      if (Mpi::Root())
+      {
          if (diag_output)
          {
             const double mem_gb =
@@ -2102,6 +2147,21 @@ int main(int argc, char *argv[])
    {
       vis_v.close();
       vis_e.close();
+   }
+
+   double vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms;
+   hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms);
+
+   if (Mpi::Root())
+   {
+      cout << "\nFINAL L2 DIAGNOSTICS\n";
+      cout << "Volume    = " << vol << "\n";
+      cout << "rho avg   = " << r_avg << "\n";
+      cout << "temp avg  = " << t_avg << "\n";
+      cout << "rho RMS   = " << r_rms << "\n";
+      cout << "temp RMS  = " << t_rms << "\n";
+      cout << "div u RMS = " << d_rms << "\n";
+      cout << "cs RMS    = " << c_rms << "\n\n";
    }
 
    // Free the used memory.

@@ -66,10 +66,10 @@ private:
    const IntegrationRule &ir;
    ParFiniteElementSpace &H1, &L2;
    const Operator *H1R;
-   Vector q_dt_est, q_e, e_vec, q_dx, q_dv;
    const QuadratureInterpolator *q1,*q2;
    const ParGridFunction &gamma_gf;
 public:
+   Vector q_dt_est, q_e, e_vec, q_dx, q_dv, q_v;
    QUpdate(const int d, const int ne, const int q1d,
            const bool visc, const bool vort,
            const double visc_const,
@@ -88,6 +88,7 @@ public:
       e_vec(NQ*NE*vdim),
       q_dx(NQ*NE*vdim*vdim),
       q_dv(NQ*NE*vdim*vdim),
+      q_v(NQ*NE*vdim),
       q1(H1.GetQuadratureInterpolator(ir)),
       q2(L2.GetQuadratureInterpolator(ir)),
       gamma_gf(gamma_gf) { }
@@ -207,6 +208,16 @@ public:
    double GetTimeStepEstimate(const Vector &S) const;
    void ResetTimeStepEstimate() const;
    void ResetQuadratureData() const { qdata_is_current = false; }
+
+   // L2 diagnostics from quadrature data (PA, final time)
+   void ComputeL2Diagnostics(const Vector &S,
+                             double &volume,
+                             double &rho_avg,
+                             double &temp_avg,
+                             double &rho_L2,
+                             double &temp_L2,
+                             double &divu_L2,
+                             double &cs_L2) const;
 
    // The density values, which are stored only at some quadrature points,
    // are projected as a ParGridFunction.

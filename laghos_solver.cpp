@@ -1759,6 +1759,7 @@ void QUpdate::UpdateQuadratureData(const Vector &S, QuadratureData &qdata)
    v.MakeRef(&H1,*S_p, H1_size);
    H1R->Mult(v, e_vec);
    q1->Derivatives(e_vec, q_dv);
+   q1->Values(e_vec, q_v);
    e.MakeRef(&L2, *S_p, 2*H1_size);
    q2->SetOutputLayout(QVectorLayout::byVDIM);
    q2->Values(e, q_e);
@@ -1815,6 +1816,161 @@ void LagrangianHydroOperator::AssembleForceMatrix() const
    LAGHOS_DEVICE_SYNC;
    timer.sw_force.Stop();
    forcemat_is_assembled = true;
+}
+
+template<int DIM>
+MFEM_HOST_DEVICE inline void L2DiagQP(
+    int e, int q, int NQ,
+    const double *gamma,
+    const double *weights,
+    const double *Jacs,
+    const double *rho0DetJ0w,
+    const double *eq,
+    const double *grad_v,
+    const double *v_quad,
+    double &vol, double &rho_sum, double &temp_sum,
+    double &rho2, double &temp2, double &div2, double &cs2)
+{
+   constexpr int DIM2 = DIM*DIM;
+   const int id = e*NQ + q;
+
+   // ---- Geometry ----
+   const double w  = weights[q];
+   const double *J = Jacs + DIM2*id;
+   const double detJ = kernels::Det<DIM>(J);
+   const double dV = w * detJ;
+
+   // ---- Thermodynamics ----
+   const double rho = rho0DetJ0w[id] / dV;
+   const double e_int = fmax(0.0, eq[id]);
+   const double T  = (gamma[e] - 1.0) * e_int;
+   const double cs = sqrt(gamma[e] * (gamma[e] - 1.0) * e_int);
+
+   // ---- div(u) ----
+   double Jinv[DIM2];
+   kernels::CalcInverse<DIM>(J, Jinv);
+
+   const double *dv = grad_v + DIM2*id;
+   double grad_phys[DIM2];
+   kernels::Mult(DIM, DIM, DIM, dv, Jinv, grad_phys);
+   const double divu = Trace<DIM,DIM>(grad_phys);
+
+   // ---- Accumulate ----
+   vol      += dV;
+   rho_sum  += rho * dV;
+   temp_sum += T   * dV;
+   rho2     += rho*rho * dV;
+   temp2    += T*T     * dV;
+   div2     += divu*divu * dV;
+   cs2      += cs*cs   * dV;
+}
+
+template<int DIM>
+static inline void L2DiagKernelPA(
+    int NE, int NQ,
+    const double *gamma,
+    const double *weights,
+    const double *Jacs,
+    const double *rho0DetJ0w,
+    const double *eq,
+    const double *grad_v,
+    const double *v_quad,
+    double *elem_out)   // size = NE * 7
+{
+   MFEM_FORALL(e, NE,
+   {
+      double vol=0.0, rho_sum=0.0, temp_sum=0.0;
+      double rho2=0.0, temp2=0.0, div2=0.0, cs2=0.0;
+
+      for (int q = 0; q < NQ; q++)
+      {
+         L2DiagQP<DIM>(e, q, NQ,
+                       gamma, weights, Jacs,
+                       rho0DetJ0w, eq, grad_v, v_quad,
+                       vol, rho_sum, temp_sum,
+                       rho2, temp2, div2, cs2);
+      }
+
+      elem_out[7*e + 0] = vol;
+      elem_out[7*e + 1] = rho_sum;
+      elem_out[7*e + 2] = temp_sum;
+      elem_out[7*e + 3] = rho2;
+      elem_out[7*e + 4] = temp2;
+      elem_out[7*e + 5] = div2;
+      elem_out[7*e + 6] = cs2;
+   });
+}
+
+void LagrangianHydroOperator::ComputeL2Diagnostics(
+    const Vector &S,
+    double &volume,
+    double &rho_avg,
+    double &temp_avg,
+    double &rho_L2,
+    double &temp_L2,
+    double &divu_L2,
+    double &cs_L2) const
+{
+   // Make sure quadrature data are current
+   UpdateQuadratureData(S);
+
+   // Number of quadrature points per element
+   const int NQ = ir.GetNPoints();
+
+   // Per-element partial sums (device-friendly)
+   Vector elem(NE * 7);
+   elem.UseDevice(true);
+
+   // Dispatch kernel
+   if (dim == 3)
+   {
+      L2DiagKernelPA<3>(NE, NQ,
+                        gamma_gf.Read(),
+                        ir.GetWeights().Read(),
+                        qupdate->q_dx.Read(),
+                        qdata.rho0DetJ0w.Read(),
+                        qupdate->q_e.Read(),
+                        qupdate->q_dv.Read(),
+                        qupdate->q_v.Read(),
+                        elem.Write());
+   }
+   else if (dim == 2)
+   {
+      L2DiagKernelPA<2>(NE, NQ,
+                        gamma_gf.Read(),
+                        ir.GetWeights().Read(),
+                        qupdate->q_dx.Read(),
+                        qdata.rho0DetJ0w.Read(),
+                        qupdate->q_e.Read(),
+                        qupdate->q_dv.Read(),
+                        qupdate->q_v.Read(),
+                        elem.Write());
+   }
+   else
+   {
+      MFEM_ABORT("L2 diagnostics not implemented for 1D.");
+   }
+
+   // Bring back to host
+   elem.HostRead();
+
+   // Local reductions
+   double loc[7] = {0,0,0,0,0,0,0};
+   for (int e = 0; e < NE; e++)
+      for (int k = 0; k < 7; k++)
+         loc[k] += elem[7*e + k];
+
+   // MPI reduction
+   double glob[7];
+   MPI_Allreduce(loc, glob, 7, MPI_DOUBLE, MPI_SUM, pmesh->GetComm());
+
+   volume   = glob[0];
+   rho_avg  = glob[1] / volume;
+   temp_avg = glob[2] / volume;
+   rho_L2   = sqrt(glob[3] / volume);
+   temp_L2  = sqrt(glob[4] / volume);
+   divu_L2  = sqrt(glob[5] / volume);
+   cs_L2    = sqrt(glob[6] / volume);
 }
 
 } // namespace hydrodynamics
