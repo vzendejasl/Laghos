@@ -1093,6 +1093,49 @@ void LagrangianHydroOperator::ComputeWorkFields(const Vector &v,
    }
 }
 
+void LagrangianHydroOperator::ComputeConductionDiagnostics(const Vector &S, double &h_con, double &h_con_rms, ParGridFunction *work_cond) const
+{
+   h_con = 0.0;
+   h_con_rms = 0.0;
+   if (work_cond) { *work_cond = 0.0; }
+   
+   if (!use_conduction) { return; }
+
+   if (p_assembly)
+   {
+       UpdateQuadratureData(S);
+       UpdateConductionOperator(S);
+
+       // Apply conduction: K_cond * e
+       Vector e_vec;
+       e_vec.MakeRef(const_cast<Vector&>(S), block_offsets[2], L2Vsize);
+       
+       Vector cond_rhs(L2Vsize);
+       cond_rhs.UseDevice(true);
+       
+       // We need M_e * de_cond = -K_cond * e
+       K_cond->Mult(e_vec, cond_rhs);
+       
+       Vector de_cond(L2Vsize);
+       Vector neg_cond_rhs(cond_rhs); 
+       neg_cond_rhs.Neg();
+       
+       CG_EMass.Mult(neg_cond_rhs, de_cond);
+       
+       h_con = IntegrateL2Field(de_cond);
+       h_con_rms = IntegrateL2FieldSquared(de_cond);
+       
+       if (work_cond)
+       {
+           *work_cond = de_cond;
+       }
+       
+       // Also update the internal member variables
+       solve_conduction_power = h_con;
+       solve_conduction_l2 = h_con_rms;
+   }
+}
+
 void LagrangianHydroOperator::ComputeAcceleration(Vector &accel,
                                                     Vector *accel_p,
                                                     Vector *accel_tau) const

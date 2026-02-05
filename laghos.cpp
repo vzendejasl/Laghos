@@ -1366,7 +1366,7 @@ int main(int argc, char *argv[])
    ParGridFunction w_baroclinic; // Baroclinic Torque
    ParGridFunction w_viscous; // Total Viscous Torque (Curl of a_visc)
    ParGridFunction w_visc_diff, w_visc_baro; // Viscous Diffusion & Viscous Baroclinic
-   ParGridFunction work_p, work_tau, work_total; // Work Diagnostic Fields
+   ParGridFunction work_p, work_tau, work_total, work_cond; // Work Diagnostic Fields
    ParGridFunction accel_gf; // Acceleration Field (RHS of Momentum)
    ParGridFunction accel_p, accel_tau; // Components of Acceleration
    ParGridFunction rho_h1, e_h1; // Intermediate H1 fields for baroclinic term
@@ -1409,9 +1409,11 @@ int main(int argc, char *argv[])
    work_p.SetSpace(&L2FESpace);
    work_tau.SetSpace(&L2FESpace);
    work_total.SetSpace(&L2FESpace);
+   work_cond.SetSpace(&L2FESpace);
    work_p = 0.0;
    work_tau = 0.0;
    work_total = 0.0;
+   work_cond = 0.0;
 
    accel_gf.SetSpace(&H1FESpace);
    accel_gf = 0.0;
@@ -1691,6 +1693,10 @@ int main(int argc, char *argv[])
       Diagnostics::ProjectL2toH1(e_gf, e_h1);
       Diagnostics::ComputeBaroclinicTerm(rho_h1, e_h1, w_baroclinic);
       hydro->ComputeWorkFields(v_gf, work_p, work_tau, work_total);
+      
+      double h_con_dummy, h_con_l2_dummy;
+      hydro->ComputeConductionDiagnostics(S, h_con_dummy, h_con_l2_dummy, &work_cond);
+
       hydro->ComputeAcceleration(accel_gf, &accel_p, &accel_tau);
 
       if (visc)
@@ -1731,6 +1737,7 @@ int main(int argc, char *argv[])
       visit_dc_debug.RegisterField("BaroclinicTorque", &w_baroclinic);
       visit_dc_debug.RegisterField("WorkPressure", &work_p);
       visit_dc_debug.RegisterField("WorkViscous", &work_tau);
+      visit_dc_debug.RegisterField("WorkConduction", &work_cond);
       visit_dc_debug.RegisterField("WorkTotal", &work_total);
       visit_dc_debug.RegisterField("Acceleration", &accel_gf);
       visit_dc_debug.RegisterField("AccelPressure", &accel_p);
@@ -1876,6 +1883,51 @@ int main(int argc, char *argv[])
               << "                  cs_rms" << std::endl;
       csv_ofs.precision(16);
       csv_ofs << std::scientific;
+   }
+
+   // Initial L2 diagnostics for laghos_thermo.csv (cycle 0)
+   {
+      double vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms;
+      hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms);
+      
+      double conduction_flux = 0.0;
+      if (use_conduction && pmesh->GetNBE() > 0)
+      {
+         Diagnostics::ProjectL2toH1(e_gf, e_h1);
+         conduction_flux =
+            Diagnostics::ComputeConductionSurfaceFlux(e_h1, kappa_e);
+      }
+      const double internal_energy = hydro->InternalEnergy(e_gf);
+
+      // Compute initial power terms
+      hydro->ComputeWorkFields(v_gf, work_p, work_tau, work_total);
+      const double p_dil = hydro->IntegrateL2Field(work_p);
+      const double v_dis = hydro->IntegrateL2Field(work_tau);
+
+      double h_con = 0.0;
+      double h_con_l2 = 0.0;
+      hydro->ComputeConductionDiagnostics(S, h_con, h_con_l2, &work_cond);
+
+      if (Mpi::Root())
+      {
+         const double ie_avg = (vol > 0.0) ? internal_energy / vol : 0.0;
+         const double h_con_rms = (vol > 0.0) ? sqrt(h_con_l2 / vol) : 0.0;
+
+         csv_ofs << std::setw(24) << 0.0 << ", "
+                 << std::setw(24) << 0.0 << ", "
+                 << std::setw(24) << ie_avg << ", "
+                 << std::setw(24) << p_dil << ", "
+                 << std::setw(24) << v_dis << ", "
+                 << std::setw(24) << h_con << ", "
+                 << std::setw(24) << h_con_rms << ", "
+                 << std::setw(24) << conduction_flux << ", "
+                 << std::setw(24) << r_avg << ", "
+                 << std::setw(24) << t_avg << ", "
+                 << std::setw(24) << r_rms << ", "
+                 << std::setw(24) << t_rms << ", "
+                 << std::setw(24) << d_rms << ", "
+                 << std::setw(24) << c_rms << std::endl;
+      }
    }
 
    for (int ti = 1; !last_step; ti++)
@@ -2107,6 +2159,10 @@ int main(int argc, char *argv[])
             Diagnostics::ProjectL2toH1(e_gf, e_h1);
             Diagnostics::ComputeBaroclinicTerm(rho_h1, e_h1, w_baroclinic);
             hydro->ComputeWorkFields(v_gf, work_p, work_tau, work_total);
+            
+            double h_con_dummy, h_con_l2_dummy;
+            hydro->ComputeConductionDiagnostics(S, h_con_dummy, h_con_l2_dummy, &work_cond);
+
             hydro->ComputeAcceleration(accel_gf, &accel_p, &accel_tau);
 
             if (visc)

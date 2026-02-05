@@ -155,9 +155,6 @@ protected:
    ForcePAOperator *ForcePA_pressure;
    ForcePAOperator *ForcePA_viscous;
 
-   double IntegrateL2Field(const Vector &z) const;
-   double IntegrateL2FieldSquared(const Vector &z) const;
-
    // Mass matrices done through partial assembly:
    // velocity (coupled H1 assembly) and energy (local L2 assemblies).
    MassPAOperator *VMassPA, *EMassPA;
@@ -247,6 +244,11 @@ public:
 
    void ComputeWorkFields(const Vector &v, ParGridFunction &work_p,
                           ParGridFunction &work_tau, ParGridFunction &work_total) const;
+
+   void ComputeConductionDiagnostics(const Vector &S, double &h_con, double &h_con_rms, ParGridFunction *work_cond = nullptr) const;
+
+   double IntegrateL2Field(const Vector &z) const;
+   double IntegrateL2FieldSquared(const Vector &z) const;
 
    void ComputeAcceleration(Vector &accel, Vector *accel_p = nullptr, Vector *accel_tau = nullptr) const;
 
