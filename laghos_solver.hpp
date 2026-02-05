@@ -156,6 +156,7 @@ protected:
    ForcePAOperator *ForcePA_viscous;
 
    double IntegrateL2Field(const Vector &z) const;
+   double IntegrateL2FieldSquared(const Vector &z) const;
 
    // Mass matrices done through partial assembly:
    // velocity (coupled H1 assembly) and energy (local L2 assemblies).
@@ -172,6 +173,7 @@ protected:
    mutable double solve_pressure_power;
    mutable double solve_viscous_power;
    mutable double solve_conduction_power;
+   mutable double solve_conduction_l2;
    mutable double solve_total_power;
    mutable bool solve_power_valid;
 
@@ -260,6 +262,7 @@ public:
    double GetSolveEnergyPressurePower() const { return solve_pressure_power; }
    double GetSolveEnergyViscousPower() const { return solve_viscous_power; }
    double GetSolveEnergyConductionPower() const { return solve_conduction_power; }
+   double GetSolveEnergyConductionL2() const { return solve_conduction_l2; }
    double GetSolveEnergyTotalPower() const { return solve_total_power; }
    bool HasSolveEnergyPower() const { return solve_power_valid; }
 };

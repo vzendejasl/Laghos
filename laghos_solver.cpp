@@ -165,6 +165,7 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    solve_pressure_power(0.0),
    solve_viscous_power(0.0),
    solve_conduction_power(0.0),
+   solve_conduction_l2(0.0),
    solve_total_power(0.0),
    solve_power_valid(false),
    rhs_c_gf(&H1c),
@@ -577,8 +578,9 @@ void LagrangianHydroOperator::SolveEnergy(const Vector &S, const Vector &v,
          Vector neg_cond_rhs(cond_rhs); neg_cond_rhs.Neg();
          CG_EMass.Mult(neg_cond_rhs, de_cond);
          solve_conduction_power = IntegrateL2Field(de_cond);
+         solve_conduction_l2 = IntegrateL2FieldSquared(de_cond);
       }
-      else { solve_conduction_power = 0.0; }
+      else { solve_conduction_power = 0.0; solve_conduction_l2 = 0.0; }
 
       LAGHOS_DEVICE_SYNC;
       timer.sw_cgL2.Start();
@@ -718,8 +720,8 @@ void LagrangianHydroOperator::UpdateConductionOperator(const Vector &S) const
       new DGDiffusionIntegrator(*cond_coeff, sigma_cond, kappa_dg_cond));
    if (pmesh->GetNBE() > 0)
    {
-      K_cond_bf->AddBdrFaceIntegrator(
-         new DGDiffusionIntegrator(*cond_coeff, sigma_cond, kappa_dg_cond));
+      //K_cond_bf->AddBdrFaceIntegrator(
+      //   new DGDiffusionIntegrator(*cond_coeff, sigma_cond, kappa_dg_cond));
    }
 
    K_cond_bf->Assemble();
@@ -951,6 +953,35 @@ double LagrangianHydroOperator::IntegrateL2Field(const Vector &z) const
 
       // identical to your InternalEnergy integrator (norm=1.0, VDIM=1)
       local = ComputeVolumeIntegral(L2, dim, NE, NQ, Q1D, 1, 1.0,
+                                    qdata.rho0DetJ0w, q_val);
+   }
+
+   MPI_Allreduce(&local, &glob, 1, MPI_DOUBLE, MPI_SUM, L2.GetComm());
+   return glob;
+}
+
+double LagrangianHydroOperator::IntegrateL2FieldSquared(const Vector &z) const
+{
+   double glob = 0.0, local = 0.0;
+
+   if (L2.GetNE() > 0) // UsesTensorBasis does not handle empty local mesh
+   {
+      auto ordering =
+         UsesTensorBasis(L2) ?
+         ElementDofOrdering::LEXICOGRAPHIC : ElementDofOrdering::NATIVE;
+
+      auto qi = L2.GetQuadratureInterpolator(ir);
+      qi->SetOutputLayout(QVectorLayout::byVDIM);
+      auto r  = L2.GetElementRestriction(ordering);
+
+      const int NQ = ir.GetNPoints();
+      const int ND = L2.GetFE(0)->GetDof();
+
+      Vector e_vec(NE*ND), q_val(NE*NQ);
+      r->Mult(z, e_vec);
+      qi->Values(e_vec, q_val);
+
+      local = ComputeVolumeIntegral(L2, dim, NE, NQ, Q1D, 1, 2.0,
                                     qdata.rho0DetJ0w, q_val);
    }
 

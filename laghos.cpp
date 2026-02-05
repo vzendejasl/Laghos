@@ -1866,6 +1866,7 @@ int main(int argc, char *argv[])
               << "            PressureWork,"
               << "             ViscousWork,"
               << "     HeatConductionPower,"
+              << "       HeatConductionRMS,"
               << " HeatConductionSurfaceFlux,"
               << "                 rho_avg,"
               << "                temp_avg,"
@@ -2028,6 +2029,8 @@ int main(int argc, char *argv[])
             const double p_dil = hydro->GetSolveEnergyPressurePower();
             const double v_dis = hydro->GetSolveEnergyViscousPower();
             const double h_con = hydro->GetSolveEnergyConductionPower();
+            const double h_con_l2 = hydro->GetSolveEnergyConductionL2();
+            const double h_con_rms = (vol > 0.0) ? sqrt(h_con_l2 / vol) : 0.0;
 
             csv_ofs << std::setw(24) << t << ", "
                     << std::setw(24) << static_cast<double>(ti) << ", "
@@ -2035,6 +2038,7 @@ int main(int argc, char *argv[])
                     << std::setw(24) << p_dil << ", "
                     << std::setw(24) << v_dis << ", "
                     << std::setw(24) << h_con << ", "
+                    << std::setw(24) << h_con_rms << ", "
                     << std::setw(24) << conduction_flux << ", "
                     << std::setw(24) << r_avg << ", "
                     << std::setw(24) << t_avg << ", "
