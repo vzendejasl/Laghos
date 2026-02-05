@@ -256,6 +256,7 @@ public:
    double ComputeTotalWork(const Vector &v, double dt) const;
    double ComputePressureWork(const Vector &v, double dt) const;
    double ComputeViscousWork(const Vector &v, double dt) const;
+   double ComputeConductionWork(const Vector &S, double dt) const;
    double GetSolveEnergyPressurePower() const { return solve_pressure_power; }
    double GetSolveEnergyViscousPower() const { return solve_viscous_power; }
    double GetSolveEnergyConductionPower() const { return solve_conduction_power; }

@@ -438,6 +438,64 @@ void ProjectL2toH1(ParGridFunction &l2_func, ParGridFunction &h1_func)
    }
 }
 
+double ComputeConductionSurfaceFlux(ParGridFunction &e_h1,
+                                    const double kappa_e)
+{
+   ParFiniteElementSpace *h1_fes = e_h1.ParFESpace();
+   ParMesh *pmesh = h1_fes->GetParMesh();
+   const int dim = pmesh->Dimension();
+
+   if (pmesh->GetNBE() == 0 || kappa_e == 0.0)
+   {
+      return 0.0;
+   }
+
+   e_h1.HostRead();
+
+   double local = 0.0;
+   Vector grad(dim), nor(dim);
+
+   for (int be = 0; be < pmesh->GetNBE(); ++be)
+   {
+      FaceElementTransformations *ftr = pmesh->GetBdrFaceTransformations(be);
+      if (!ftr) { continue; }
+
+      const FiniteElement *fe = h1_fes->GetFE(ftr->Elem1No);
+      const int intorder = 2 * fe->GetOrder();
+      const IntegrationRule &ir =
+         IntRules.Get(ftr->GetGeometryType(), intorder);
+
+      for (int j = 0; j < ir.GetNPoints(); ++j)
+      {
+         const IntegrationPoint &ip = ir.IntPoint(j);
+         ftr->SetIntPoint(&ip);
+
+         ElementTransformation &tr = ftr->GetElement1Transformation();
+         const IntegrationPoint &eip = ftr->GetElement1IntPoint();
+         tr.SetIntPoint(&eip);
+
+         e_h1.GetGradient(tr, grad);
+
+         if (dim > 1)
+         {
+            CalcOrtho(ftr->Face->Jacobian(), nor);
+         }
+         else
+         {
+            nor.SetSize(1);
+            nor(0) = 1.0;
+         }
+
+         const double q_dot_n = -kappa_e * (grad * nor);
+         local += ip.weight * q_dot_n;
+      }
+   }
+
+   double global = 0.0;
+   MPI_Allreduce(&local, &global, 1, MPI_DOUBLE, MPI_SUM, pmesh->GetComm());
+   return global;
+}
+
 void ComputeBaroclinicTerm(ParGridFunction &rho_h1, ParGridFunction &e_h1,
                            ParGridFunction &w_baroclinic)
 {
@@ -843,6 +901,7 @@ int main(int argc, char *argv[])
    bool fixed_viscosity = false;
    double reynolds = -1.0;
    double viscosity_const = -1.0;
+   double kappa_e = 0.0;
    bool use_conduction = false;
    double prandtl_number = 0.71;
    bool visualization = false;
@@ -1546,16 +1605,16 @@ int main(int argc, char *argv[])
       const double rho_ref = rho0(x0);
       const double L = 1.0 / (2.0 * M_PI);
       viscosity_const = rho_ref * mach_u0 * L / reynolds;
+      const double gamma_ref = gamma_func(x0);
+      kappa_e = (prandtl_number > 0.0) ? (viscosity_const * gamma_ref) / prandtl_number : 0.0;
       if (Mpi::Root())
       {
          cout << "Fixed viscosity enabled: Re = " << reynolds
               << ", mu = " << viscosity_const << endl;
          if (use_conduction)
          {
-            const double gamma = gamma_func(x0);
             cout << "Heat conduction enabled: Pr = " << prandtl_number
-                 << ", kappa = "
-                 << (prandtl_number > 0.0 ? (viscosity_const * gamma) / prandtl_number : 0.0)
+                 << ", kappa = " << kappa_e
                  << endl;
          }
       }
@@ -1806,7 +1865,8 @@ int main(int argc, char *argv[])
               << "       InternalEnergyAvg,"
               << "            PressureWork,"
               << "             ViscousWork,"
-              << "      HeatConductionWork,"
+              << "     HeatConductionPower,"
+              << " HeatConductionSurfaceFlux,"
               << "                 rho_avg,"
               << "                temp_avg,"
               << "                 rho_rms,"
@@ -1875,6 +1935,7 @@ int main(int argc, char *argv[])
       double total_work = 0.0;
       double pressure_work = 0.0;
       double viscous_work = 0.0;
+      double conduction_flux = 0.0;
       double enstrophy = 0.0;
       double e_integral = 0.0;
       if (log_step)
@@ -1894,6 +1955,12 @@ int main(int argc, char *argv[])
          total_work = hydro->ComputeTotalWork(v_gf, dt);
          pressure_work = hydro->ComputePressureWork(v_gf, dt);
          viscous_work = hydro->ComputeViscousWork(v_gf, dt);
+         if (use_conduction && pmesh->GetNBE() > 0)
+         {
+            Diagnostics::ProjectL2toH1(e_gf, e_h1);
+            conduction_flux =
+               Diagnostics::ComputeConductionSurfaceFlux(e_h1, kappa_e);
+         }
          if (diag_output) { enstrophy = ComputeEnstrophy(v_gf); }
          if (track_e_integral)
          {
@@ -1932,13 +1999,22 @@ int main(int argc, char *argv[])
          }
          if (log_step)
          {
-            cout << "[work] dt=" << std::scientific << std::setprecision(6) << dt 
-                 << ", total=" << total_work
-                 << ", pressure=" << pressure_work 
-                 << ", viscous=" << viscous_work
-                 << ", sum=" << (pressure_work + viscous_work)
-                 << ", verification=" << (total_work - (pressure_work + viscous_work))
-                 << endl;
+            if (hydro->HasSolveEnergyPower())
+            {
+               const double total_power = hydro->GetSolveEnergyTotalPower();
+               const double pressure_power = hydro->GetSolveEnergyPressurePower();
+               const double viscous_power = hydro->GetSolveEnergyViscousPower();
+               const double conduction_power = hydro->GetSolveEnergyConductionPower();
+               const double sum_power = pressure_power + viscous_power + conduction_power;
+               cout << "[power] dt=" << std::scientific << std::setprecision(6) << dt
+                    << ", total=" << total_power
+                    << ", pressure=" << pressure_power
+                    << ", viscous=" << viscous_power
+                    << ", conduction=" << conduction_power
+                    << ", sum=" << sum_power
+                    << ", verification=" << (total_power - sum_power)
+                    << endl;
+            }
          }
       }
 
@@ -1959,6 +2035,7 @@ int main(int argc, char *argv[])
                     << std::setw(24) << p_dil << ", "
                     << std::setw(24) << v_dis << ", "
                     << std::setw(24) << h_con << ", "
+                    << std::setw(24) << conduction_flux << ", "
                     << std::setw(24) << r_avg << ", "
                     << std::setw(24) << t_avg << ", "
                     << std::setw(24) << r_rms << ", "

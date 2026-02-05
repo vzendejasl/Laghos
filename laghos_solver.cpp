@@ -999,6 +999,29 @@ double LagrangianHydroOperator::ComputeViscousWork(const Vector &v, double dt) c
    return viscous_power * dt;
 }
 
+double LagrangianHydroOperator::ComputeConductionWork(const Vector &S,
+                                                      double dt) const
+{
+   if (!use_conduction) { return 0.0; }
+
+   // Ensure mesh and conduction operator are consistent with S.
+   UpdateMesh(S);
+   UpdateConductionOperator(S);
+
+   Vector e_vec;
+   e_vec.MakeRef(const_cast<Vector&>(S), block_offsets[2], L2Vsize);
+   Vector cond_rhs(L2Vsize);
+   cond_rhs.UseDevice(true);
+   K_cond->Mult(e_vec, cond_rhs);
+
+   Vector de_cond(L2Vsize);
+   Vector neg_cond_rhs(cond_rhs); neg_cond_rhs.Neg();
+   CG_EMass.Mult(neg_cond_rhs, de_cond);
+
+   const double conduction_power = IntegrateL2Field(de_cond);
+   return conduction_power * dt;
+}
+
 void LagrangianHydroOperator::ComputeWorkFields(const Vector &v,
                                                 ParGridFunction &work_p,
                                                 ParGridFunction &work_tau,
