@@ -83,6 +83,9 @@ static double mach_number = -1.0;
 static double mach_u0 = 1.0;
 static double p0_background = 1.0;
 
+// Global bounding box for initialization
+Vector bb_min, bb_max;
+
 // Forward declarations.
 double e0(const Vector &);
 double rho0(const Vector &);
@@ -838,6 +841,8 @@ int main(int argc, char *argv[])
    bool fixed_viscosity = false;
    double reynolds = -1.0;
    double viscosity_const = -1.0;
+   bool use_conduction = false;
+   double prandtl_number = 0.71;
    bool visualization = false;
    int vis_steps = 5;
    bool visit = false;
@@ -905,6 +910,11 @@ int main(int argc, char *argv[])
                   "Use constant physical viscosity (overrides artificial).");
    args.AddOption(&reynolds, "-Re", "--reynolds",
                   "Reynolds number for fixed viscosity (L=1/(2*pi)).");
+   args.AddOption(&use_conduction, "-cond", "--conduction", "-no-cond",
+                  "--no-conduction",
+                  "Enable or disable heat conduction.");
+   args.AddOption(&prandtl_number, "-pr", "--prandtl",
+                  "Prandtl number for heat conduction.");
    args.AddOption(&visualization, "-vis", "--visualization", "-no-vis",
                   "--no-visualization",
                   "Enable or disable GLVis visualization.");
@@ -1199,6 +1209,8 @@ int main(int argc, char *argv[])
    // Refine the mesh further in parallel to increase the resolution.
    for (int lev = 0; lev < rp_levels; lev++) { pmesh->UniformRefinement(); }
 
+   pmesh->GetBoundingBox(bb_min, bb_max);
+
    if (!cartesian_partitioning && enable_nc && dim > 1)
    {
       if (myid == 0) { cout << "Rebalancing mesh" << endl; }
@@ -1352,6 +1364,19 @@ int main(int argc, char *argv[])
    v_visc_gf.SetSpace(&H1FESpace);
    v_visc_gf = 0.0;
 
+   ParGridFunction T_gf(&L2FESpace);
+   T_gf = 0.0;
+
+   // Integral of specific internal energy for problem 8 (heat conduction compare)
+   ConstantCoefficient one_e(1.0);
+   ParLinearForm e_int_lf(&L2FESpace);
+   const bool track_e_integral = (problem == 8);
+   if (track_e_integral)
+   {
+      e_int_lf.AddDomainIntegrator(new DomainLFIntegrator(one_e));
+      e_int_lf.Assemble();
+   }
+
    // ---- Jacobian diagnostics fields ----
    const int vis_order = order_v;
    const int qorder    = 2*order_v; 
@@ -1428,6 +1453,13 @@ int main(int argc, char *argv[])
          cout << "The hydrodynamic energy is : " << Eu0 << endl;
       }
    }
+
+   // Diagnostic for initial conduction state
+   if (use_conduction && Mpi::Root())
+   {
+      cout << "Problem 8 Bounding Box: min = (" << bb_min(0) << "," << bb_min(1) << (dim==3 ? ","+std::to_string(bb_min(2)) : "") << "), "
+           << "max = (" << bb_max(0) << "," << bb_max(1) << (dim==3 ? ","+std::to_string(bb_max(2)) : "") << ")" << endl;
+   }
    ParGridFunction rho0_gf(&L2FESpace);
    FunctionCoefficient rho0_func_coeff(rho0);
    L2_FECollection l2_fec(order_e, pmesh->Dimension());
@@ -1448,8 +1480,33 @@ int main(int argc, char *argv[])
       l2_e.ProjectCoefficient(e_coeff);
    }
    e_gf.ProjectGridFunction(l2_e);
+   if (problem == 8 && Mpi::Root())
+   {
+      cout << "e min/max: " << e_gf.Min() << " " << e_gf.Max() << endl;
+   }
    // Sync the data location of e_gf with its base, S
    e_gf.SyncAliasMemory(S);
+
+   if (problem == 8)
+   {
+      double loc_energy = e_gf * e_gf;
+      double energy_init_dg;
+      MPI_Allreduce(&loc_energy, &energy_init_dg, 1, MPI_DOUBLE, MPI_SUM, pmesh->GetComm());
+      
+      ParLinearForm LF_dg(&L2FESpace);
+      ConstantCoefficient one_dg(1.0);
+      LF_dg.AddDomainIntegrator(new DomainLFIntegrator(one_dg));
+      LF_dg.Assemble();
+      double loc_integral = LF_dg(e_gf);
+      double integral_init_dg;
+      MPI_Allreduce(&loc_integral, &integral_init_dg, 1, MPI_DOUBLE, MPI_SUM, pmesh->GetComm());
+
+      if (Mpi::Root())
+      {
+         cout << "Initial L2 energy (e*e): " << energy_init_dg << endl;
+         cout << "Initial total integral (e): " << integral_init_dg << endl;
+      }
+   }
 
    GridFunctionCoefficient rho0_coeff(&rho0_gf);
 
@@ -1473,6 +1530,7 @@ int main(int argc, char *argv[])
       case 5: visc = true; break;
       case 6: visc = true; break;
       case 7: source = 2; visc = true; vorticity = true;  break;
+      case 8: visc = true; break;
       default: MFEM_ABORT("Wrong problem specification!");
    }
    if (impose_visc) { visc = true; }
@@ -1488,6 +1546,14 @@ int main(int argc, char *argv[])
       {
          cout << "Fixed viscosity enabled: Re = " << reynolds
               << ", mu = " << viscosity_const << endl;
+         if (use_conduction)
+         {
+            const double gamma = gamma_func(x0);
+            const double kappa = (gamma - 1.0 > 0.0) ? 
+               (viscosity_const * gamma) / (prandtl_number * (gamma - 1.0)) : 0.0;
+            cout << "Heat conduction enabled: Pr = " << prandtl_number
+                 << ", kappa = " << kappa << endl;
+         }
       }
       visc = true;
    }
@@ -1496,12 +1562,19 @@ int main(int argc, char *argv[])
       viscosity_const = -1.0;
    }
 
+   if (use_conduction)
+   {
+      MFEM_VERIFY(fixed_viscosity,
+                  "Heat conduction currently requires fixed viscosity (-fv).");
+   }
+
    auto hydro = std::make_unique<hydrodynamics::LagrangianHydroOperator>(
       S.Size(),
       H1FESpace, L2FESpace, ess_tdofs,
       rho0_coeff, rho0_gf,
       mat_gf, source, cfl,
       visc, vorticity, viscosity_const,
+      use_conduction, prandtl_number,
       p_assembly,
       cg_tol, cg_max_iter, ftz_tol,
       order_q);
@@ -1573,15 +1646,21 @@ int main(int argc, char *argv[])
       //    ComputeCurl(v_visc_gf, w_viscous);
       // }
 
+      T_gf = e_gf;
+      // T = (gamma - 1) * e
+      if (NE > 0) { T_gf *= (gamma_func(Vector({0.0})) - 1.0); }
+
       visit_dc.RegisterField("Density",  &rho_gf);
       visit_dc.RegisterField("Velocity", &v_gf);
       visit_dc.RegisterField("Specific Internal Energy", &e_gf);
+      visit_dc.RegisterField("Temperature", &T_gf);
       visit_dc.RegisterField("Vorticity", &w_gf);
       visit_dc.SetCycle(0);
       visit_dc.SetTime(0.0);
       visit_dc.Save();
 
       visit_dc_debug.RegisterField("Vorticity", &w_gf);
+      visit_dc_debug.RegisterField("Temperature", &T_gf);
       visit_dc_debug.RegisterField("VortexStretching", &w_stretch);
       visit_dc_debug.RegisterField("VortexCompression", &w_compress);
       visit_dc_debug.RegisterField("BaroclinicTorque", &w_baroclinic);
@@ -1629,7 +1708,8 @@ int main(int argc, char *argv[])
                << "                mass,Host Memory Use (GB),"
                << "         total_power,      pressure_power,"
                << "       viscous_power,  solve_total_power,"
-               << " solve_pressure_power,  solve_viscous_power" << std::endl;
+               << " solve_pressure_power,  solve_viscous_power,"
+               << " solve_conduction_power" << std::endl;
    }
    ConstantCoefficient zero_coeff(0.0);
    const double mass0 = diag_output ? rho0_gf.ComputeL1Error(zero_coeff) : 0.0;
@@ -1668,6 +1748,7 @@ int main(int argc, char *argv[])
          const double solve_total_power0 = 0.0;
          const double solve_pressure_power0 = 0.0;
          const double solve_viscous_power0 = 0.0;
+         const double solve_conduction_power0 = 0.0;
          diag_ofs << t << ","
                   << 0.0 << ","
                   << dt << ","
@@ -1681,7 +1762,8 @@ int main(int argc, char *argv[])
                   << viscous_power0 << ","
                   << solve_total_power0 << ","
                   << solve_pressure_power0 << ","
-                  << solve_viscous_power0 << std::endl;
+                  << solve_viscous_power0 << ","
+                  << solve_conduction_power0 << std::endl;
       }
    }
 
@@ -1713,8 +1795,10 @@ int main(int argc, char *argv[])
       csv_ofs.open("laghos_thermo.csv");
       csv_ofs << "                    Time,"
               << "                   Cycle,"
-              << "      PressureDilatation,"
-              << "      ViscousDissipation,"
+              << "       InternalEnergyAvg,"
+              << "            PressureWork,"
+              << "             ViscousWork,"
+              << "      HeatConductionWork,"
               << "                 rho_avg,"
               << "                temp_avg,"
               << "                 rho_rms,"
@@ -1781,6 +1865,7 @@ int main(int argc, char *argv[])
       double pressure_work = 0.0;
       double viscous_work = 0.0;
       double enstrophy = 0.0;
+      double e_integral = 0.0;
       if (log_step)
       {
          double lnorm = e_gf * e_gf, norm;
@@ -1799,6 +1884,12 @@ int main(int argc, char *argv[])
          pressure_work = hydro->ComputePressureWork(v_gf, dt);
          viscous_work = hydro->ComputeViscousWork(v_gf, dt);
          if (diag_output) { enstrophy = ComputeEnstrophy(v_gf); }
+         if (track_e_integral)
+         {
+            const double loc_integral = e_int_lf(e_gf);
+            MPI_Allreduce(&loc_integral, &e_integral, 1, MPI_DOUBLE, MPI_SUM,
+                          pmesh->GetComm());
+         }
       }
       if (Mpi::Root())
       {
@@ -1816,6 +1907,11 @@ int main(int argc, char *argv[])
                  << kinetic_energy
                  << ",\t|E| = " << std::setprecision(10) << std::scientific
                  << kinetic_energy+internal_energy;
+            if (track_e_integral)
+            {
+               cout << ",\tintegral(e) = " << std::setprecision(10)
+                    << std::scientific << e_integral;
+            }
             cout << std::fixed;
             if (mem_usage)
             {
@@ -1841,13 +1937,17 @@ int main(int argc, char *argv[])
          hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms);
          if (Mpi::Root())
          {
+            const double ie_avg = internal_energy / vol;
             const double p_dil = hydro->GetSolveEnergyPressurePower();
             const double v_dis = hydro->GetSolveEnergyViscousPower();
+            const double h_con = hydro->GetSolveEnergyConductionPower();
 
             csv_ofs << std::setw(24) << t << ", "
                     << std::setw(24) << static_cast<double>(ti) << ", "
+                    << std::setw(24) << ie_avg << ", "
                     << std::setw(24) << p_dil << ", "
                     << std::setw(24) << v_dis << ", "
+                    << std::setw(24) << h_con << ", "
                     << std::setw(24) << r_avg << ", "
                     << std::setw(24) << t_avg << ", "
                     << std::setw(24) << r_rms << ", "
@@ -1873,6 +1973,8 @@ int main(int argc, char *argv[])
                hydro->GetSolveEnergyPressurePower();
             const double solve_viscous_power =
                hydro->GetSolveEnergyViscousPower();
+            const double solve_conduction_power =
+               hydro->GetSolveEnergyConductionPower();
             diag_ofs << t << ","
                      << static_cast<double>(ti) << ","
                      << dt << ","
@@ -1886,7 +1988,8 @@ int main(int argc, char *argv[])
                      << viscous_power << ","
                      << solve_total_power << ","
                      << solve_pressure_power << ","
-                     << solve_viscous_power << std::endl;
+                     << solve_viscous_power << ","
+                     << solve_conduction_power << std::endl;
          }
       }
 
@@ -1898,6 +2001,9 @@ int main(int argc, char *argv[])
 
          if (visualization || visit || gfprint) { hydro->ComputeDensity(rho_gf); }
          
+         T_gf = e_gf;
+         if (NE > 0) { T_gf *= (gamma_func(Vector({0.0})) - 1.0); }
+
          // Compute Vorticity
          if (visit)
          {
@@ -2085,6 +2191,7 @@ int main(int argc, char *argv[])
                rho0_coeff, rho0_gf,
                mat_gf, source, cfl,
                visc, vorticity, viscosity_const,
+               use_conduction, prandtl_number,
                p_assembly,
                cg_tol, cg_max_iter, ftz_tol,
                order_q);
@@ -2197,6 +2304,7 @@ double rho0(const Vector &x)
          return 1.0;
       }
       case 7: return x(1) >= 0.0 ? 2.0 : 1.0;
+      case 8: return 1.0;
       default: MFEM_ABORT("Bad number given for problem id!"); return 0.0;
    }
 }
@@ -2215,6 +2323,7 @@ double gamma_func(const Vector &x)
       case 5: return 1.4;
       case 6: return 1.4;
       case 7: return 5.0 / 3.0;
+      case 8: return 5.0 / 3.0;
       default: MFEM_ABORT("Bad number given for problem id!"); return 0.0;
    }
 }
@@ -2283,6 +2392,7 @@ void v0(const Vector &x, Vector &v)
          v(1) = 0.02 * exp(-2*M_PI*x(1)*x(1)) * cos(2*M_PI*x(0));
          break;
       }
+      case 8: v = 0.0; break;
       default: MFEM_ABORT("Bad number given for problem id!");
    }
 }
@@ -2359,6 +2469,26 @@ double e0(const Vector &x)
       {
          const double rho = rho0(x), gamma = gamma_func(x);
          return (6.0 - rho * x(1)) / (gamma - 1.0) / rho;
+      }
+      case 8:
+      {
+         Vector center(x.Size());
+         double min_box_span = std::numeric_limits<double>::max();
+         for (int i = 0; i < x.Size(); i++)
+         {
+            center(i) = 0.5 * (bb_min(i) + bb_max(i));
+            min_box_span = std::min(min_box_span, bb_max(i) - bb_min(i));
+         }
+         const double radius = 0.2 * min_box_span;
+         const double radius2 = radius * radius;
+         double r2 = 0.0;
+         for (int i = 0; i < x.Size(); i++)
+         {
+            const double dx = x(i) - center(i);
+            r2 += dx * dx;
+         }
+         double T = (r2 <= radius2) ? 2.0 : 0.0;
+         return T;
       }
       default: MFEM_ABORT("Bad number given for problem id!"); return 0.0;
    }

@@ -103,6 +103,8 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
                                                  const bool visc,
                                                  const bool vort,
                                                  const double visc_const,
+                                                 const bool cond,
+                                                 const double prandtl,
                                                  const bool p_assembly,
                                                  const double cgt,
                                                  const int cgiter,
@@ -127,7 +129,9 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    source_type(source), cfl(cfl),
    use_viscosity(visc),
    use_vorticity(vort),
+   use_conduction(cond),
    viscosity_const(visc_const),
+   prandtl_number(prandtl),
    p_assembly(p_assembly),
    cg_rel_tol(cgt), cg_max_iter(cgiter),ftz_tol(ftz),
    gamma_gf(gamma_gf),
@@ -158,11 +162,26 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    e_rhs_tau(L2Vsize),
    solve_pressure_power(0.0),
    solve_viscous_power(0.0),
+   solve_conduction_power(0.0),
    solve_total_power(0.0),
    solve_power_valid(false),
    rhs_c_gf(&H1c),
-   dvc_gf(&H1c)
+   dvc_gf(&H1c),
+   K_cond_bf(nullptr),
+   u_cond_gf(nullptr),
+   cond_coeff(nullptr),
+   sigma_cond(-1.0),
+   kappa_dg_cond(-1.0)
 {
+   if (use_conduction)
+   {
+      sigma_cond = -1.0;
+      kappa_dg_cond = (L2.GetOrder(0) + 1) * (L2.GetOrder(0) + 1);
+
+      u_cond_gf = new ParGridFunction(&L2);
+      cond_coeff = new GridFunctionCoefficient(u_cond_gf);
+   }
+
    // Initialize new pressure and viscous tensors to zero on device
    Vector v_p(qdata.pressureJinvT.Data(), qdata.pressureJinvT.TotalSize());
    Vector v_v(qdata.viscousJinvT.Data(), qdata.viscousJinvT.TotalSize());
@@ -358,6 +377,9 @@ LagrangianHydroOperator::~LagrangianHydroOperator()
       delete ForcePA_pressure;
       delete ForcePA_viscous;
    }
+   delete K_cond_bf;
+   delete u_cond_gf;
+   delete cond_coeff;
 }
 
 void LagrangianHydroOperator::Mult(const Vector &S, Vector &dS_dt) const
@@ -492,6 +514,11 @@ void LagrangianHydroOperator::SolveEnergy(const Vector &S, const Vector &v,
    UpdateQuadratureData(S);
    AssembleForceMatrix();
 
+   if (use_conduction)
+   {
+      UpdateConductionOperator(S);
+   }
+
    // The monolithic BlockVector stores the unknown fields as follows:
    // (Position, Velocity, Specific Internal Energy).
    ParGridFunction de;
@@ -522,6 +549,27 @@ void LagrangianHydroOperator::SolveEnergy(const Vector &S, const Vector &v,
       LAGHOS_DEVICE_SYNC;
       timer.sw_force.Stop();
       if (e_source) { e_rhs += *e_source; }
+
+      if (use_conduction)
+      {
+         // Apply conduction: e_rhs -= K_cond * e
+         Vector e_vec;
+         e_vec.MakeRef(const_cast<Vector&>(S), block_offsets[2], L2Vsize);
+         MFEM_VERIFY(K_cond.Ptr() != nullptr, "K_cond operator is null.");
+         MFEM_VERIFY(K_cond->Width() == L2Vsize,
+                     "K_cond expects true dofs; size mismatch.");
+         Vector cond_rhs(L2Vsize);
+         cond_rhs.UseDevice(true);
+         K_cond->Mult(e_vec, cond_rhs);
+         e_rhs.Add(-1.0, cond_rhs);
+
+         // Compute conduction power: M_e * de_cond = -K_cond * e
+         Vector de_cond(L2Vsize);
+         Vector neg_cond_rhs(cond_rhs); neg_cond_rhs.Neg();
+         CG_EMass.Mult(neg_cond_rhs, de_cond);
+         solve_conduction_power = IntegrateL2Field(de_cond);
+      }
+      else { solve_conduction_power = 0.0; }
 
       LAGHOS_DEVICE_SYNC;
       timer.sw_cgL2.Start();
@@ -564,6 +612,7 @@ void LagrangianHydroOperator::SolveEnergy(const Vector &S, const Vector &v,
       // Integrate to "power" diagnostics
       const double Pp   = IntegrateL2Field(de_p);
       const double Ptau = IntegrateL2Field(de_tau);
+      const double Pcond = solve_conduction_power;
       const double total_rhs_power = IntegrateL2Field(de);
       solve_pressure_power = Pp;
       solve_viscous_power = Ptau;
@@ -624,6 +673,61 @@ void LagrangianHydroOperator::UpdateMesh(const Vector &S) const
    H1.GetParMesh()->NewNodes(x_gf, false);
 }
 
+void LagrangianHydroOperator::UpdateConductionOperator(const Vector &S) const
+{
+   const double Pr = prandtl_number;
+   double local_gamma = 0.0;
+   if (gamma_gf.Size() > 0) { local_gamma = gamma_gf(0); }
+   double gamma;
+   MPI_Allreduce(&local_gamma, &gamma, 1, MPI_DOUBLE, MPI_MAX, H1.GetComm());
+
+   const double mu = (viscosity_const >= 0.0) ? viscosity_const : 0.0;
+   const double kappa = (gamma - 1.0 > 0.0) ? (mu * gamma) / (Pr * (gamma - 1.0)) : 0.0;
+   const double kappa_e = mu * gamma / Pr;
+
+   if (Mpi::Root() && t == 0.0)
+   {
+      std::cout << "Conduction enabled: Pr = " << Pr 
+                << ", mu = " << mu 
+                << ", gamma = " << gamma
+                << ", kappa = " << kappa 
+                << ", applied_coeff_e = " << kappa_e << std::endl;
+   }
+
+   *u_cond_gf = kappa_e;
+   u_cond_gf->ExchangeFaceNbrData();
+
+   // Create a fresh operator to handle changing mesh coordinates.
+   K_cond.Clear();
+   delete K_cond_bf;
+   K_cond_bf = new ParBilinearForm(&L2);
+   if (p_assembly)
+   {
+      K_cond_bf->SetAssemblyLevel(AssemblyLevel::PARTIAL);
+   }
+   K_cond_bf->AddDomainIntegrator(new DiffusionIntegrator(*cond_coeff));
+   K_cond_bf->AddInteriorFaceIntegrator(
+      new DGDiffusionIntegrator(*cond_coeff, sigma_cond, kappa_dg_cond));
+   if (pmesh->GetNBE() > 0)
+   {
+      K_cond_bf->AddBdrFaceIntegrator(
+         new DGDiffusionIntegrator(*cond_coeff, sigma_cond, kappa_dg_cond));
+   }
+
+   K_cond_bf->Assemble();
+   if (p_assembly)
+   {
+      K_cond.Reset(K_cond_bf, false);
+   }
+   else
+   {
+      K_cond_bf->Finalize();
+      K_cond.Reset(K_cond_bf->ParallelAssemble(), true);
+      delete K_cond_bf;
+      K_cond_bf = nullptr;
+   }
+}
+
 double LagrangianHydroOperator::GetTimeStepEstimate(const Vector &S) const
 {
    UpdateMesh(S);
@@ -631,6 +735,26 @@ double LagrangianHydroOperator::GetTimeStepEstimate(const Vector &S) const
    double glob_dt_est;
    const MPI_Comm comm = H1.GetParMesh()->GetComm();
    MPI_Allreduce(&qdata.dt_est, &glob_dt_est, 1, MPI_DOUBLE, MPI_MIN, comm);
+
+   if (use_conduction)
+   {
+      const double Pr = prandtl_number;
+      double local_gamma = 0.0;
+      if (gamma_gf.Size() > 0) { local_gamma = gamma_gf(0); }
+      double gamma;
+      MPI_Allreduce(&local_gamma, &gamma, 1, MPI_DOUBLE, MPI_MAX, H1.GetComm());
+      const double mu = (viscosity_const >= 0.0) ? viscosity_const : 0.0;
+      const double kappa_e = mu * gamma / Pr;
+
+      if (kappa_e > 0.0)
+      {
+         const double p = L2.GetOrder(0);
+         // Stability limit for explicit DG diffusion: dt < h^2 / (kappa_e * (p+1)^2)
+         const double dt_cond = 0.5 * (qdata.h0 * qdata.h0) / (kappa_e * (p + 1.0) * (p + 1.0));
+         glob_dt_est = std::min(glob_dt_est, dt_cond);
+      }
+   }
+
    return glob_dt_est;
 }
 

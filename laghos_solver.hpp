@@ -118,11 +118,20 @@ protected:
    const int dim, NE, l2dofs_cnt, h1dofs_cnt, source_type;
    const double cfl;
    const bool use_viscosity, use_vorticity, p_assembly;
+   bool use_conduction;
    const double viscosity_const;
+   double prandtl_number;
    const double cg_rel_tol;
    const int cg_max_iter;
    const double ftz_tol;
    const ParGridFunction &gamma_gf;
+
+   // DG Conduction operators
+   mutable ParBilinearForm *K_cond_bf;
+   mutable OperatorHandle K_cond;
+   mutable ParGridFunction *u_cond_gf;
+   mutable GridFunctionCoefficient *cond_coeff;
+   double sigma_cond, kappa_dg_cond;
    // Velocity mass matrix and local inverses of the energy mass matrices. These
    // are constant in time, due to the pointwise mass conservation property.
    mutable ParBilinearForm Mv;
@@ -161,6 +170,7 @@ protected:
    mutable Array<int> c_tdofs[3];
    mutable double solve_pressure_power;
    mutable double solve_viscous_power;
+   mutable double solve_conduction_power;
    mutable double solve_total_power;
    mutable bool solve_power_valid;
 
@@ -189,7 +199,9 @@ public:
                            const int source,
                            const double cfl,
                            const bool visc, const bool vort,
-                           const double visc_const, const bool pa,
+                           const double visc_const,
+                           const bool cond, const double prandtl,
+                           const bool pa,
                            const double cgt, const int cgiter, double ftz_tol,
                            const int order_q);
    ~LagrangianHydroOperator();
@@ -203,6 +215,8 @@ public:
    void SolveVelocity(const Vector &S, Vector &dS_dt) const;
    void SolveEnergy(const Vector &S, const Vector &v, Vector &dS_dt) const;
    void UpdateMesh(const Vector &S) const;
+
+   void UpdateConductionOperator(const Vector &S) const;
 
    // Calls UpdateQuadratureData to compute the new qdata.dt_estimate.
    double GetTimeStepEstimate(const Vector &S) const;
@@ -242,6 +256,7 @@ public:
    double ComputeViscousWork(const Vector &v, double dt) const;
    double GetSolveEnergyPressurePower() const { return solve_pressure_power; }
    double GetSolveEnergyViscousPower() const { return solve_viscous_power; }
+   double GetSolveEnergyConductionPower() const { return solve_conduction_power; }
    double GetSolveEnergyTotalPower() const { return solve_total_power; }
    bool HasSolveEnergyPower() const { return solve_power_valid; }
 };

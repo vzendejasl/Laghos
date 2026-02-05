@@ -97,7 +97,7 @@ CCC = $(strip $(CXX) $(LAGHOS_FLAGS) $(if $(EXTRA_INC_DIR),-I$(EXTRA_INC_DIR)))
 LAGHOS_LIBS = $(MFEM_LIBS) $(MFEM_EXT_LIBS)
 LIBS = $(strip $(LAGHOS_LIBS) $(LDFLAGS))
 
-SOURCE_FILES = $(sort $(wildcard *.cpp))
+SOURCE_FILES = $(filter-out ex16p_victor_dg.cpp, $(sort $(wildcard *.cpp)))
 HEADER_FILES = $(sort $(wildcard *.hpp))
 OBJECT_FILES = $(SOURCE_FILES:.cpp=.o)
 
