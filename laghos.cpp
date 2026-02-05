@@ -61,6 +61,7 @@
 // Example runs:
 // mpirun -np 10 ./laghos -p 0 -dim 3 -rs 1 -rp 2 -tf 0.08 -pa -visit -iv -diag output.txt -mach 0.28 -u0 1.0 -s 7 -fv -Re 100 -cfl 0.2
 // mpirun -np 8 ./laghos -p 0 -dim 3 -rs 1 -rp 2 -tf 0.3 -pa -visit -iv -diag output.txt -mach 0.28 -u0 1.0 -s 7 -fv -Re 200 -cfl 0.5 --interp-cycle 1
+// mpirun -np 8 ./laghos -p 8 -dim 3 -rs 1 -rp 2 -ok 2 -ot 1 -s 2 -tf 0.1 -fv -Re 66.6732 -cond -pr 0.71 -ms 1000 -visit -dt 1e-3
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -828,6 +829,7 @@ int main(int argc, char *argv[])
    int order_q = -1;
    int ode_solver_type = 4;
    double t_final = 0.6;
+   double fixed_dt = -1.0;
    double cfl = 0.5;
    double cg_tol = 1e-8;
    double ftz_tol = 0.0;
@@ -884,6 +886,8 @@ int main(int argc, char *argv[])
                   "            7 - RK2Avg.");
    args.AddOption(&t_final, "-tf", "--t-final",
                   "Final time; start time is 0.");
+   args.AddOption(&fixed_dt, "-dt", "--time-step",
+                  "Fixed time step (disables CFL-based adaptivity).");
    args.AddOption(&cfl, "-cfl", "--cfl", "CFL-condition number.");
    args.AddOption(&cg_tol, "-cgt", "--cg-tol",
                   "Relative CG tolerance (velocity linear solve).");
@@ -1549,10 +1553,10 @@ int main(int argc, char *argv[])
          if (use_conduction)
          {
             const double gamma = gamma_func(x0);
-            const double kappa = (gamma - 1.0 > 0.0) ? 
-               (viscosity_const * gamma) / (prandtl_number * (gamma - 1.0)) : 0.0;
             cout << "Heat conduction enabled: Pr = " << prandtl_number
-                 << ", kappa = " << kappa << endl;
+                 << ", kappa = "
+                 << (prandtl_number > 0.0 ? (viscosity_const * gamma) / prandtl_number : 0.0)
+                 << endl;
          }
       }
       visc = true;
@@ -1568,6 +1572,7 @@ int main(int argc, char *argv[])
                   "Heat conduction currently requires fixed viscosity (-fv).");
    }
 
+   const bool freeze_momentum = (problem == 8);
    auto hydro = std::make_unique<hydrodynamics::LagrangianHydroOperator>(
       S.Size(),
       H1FESpace, L2FESpace, ess_tdofs,
@@ -1575,6 +1580,7 @@ int main(int argc, char *argv[])
       mat_gf, source, cfl,
       visc, vorticity, viscosity_const,
       use_conduction, prandtl_number,
+      freeze_momentum,
       p_assembly,
       cg_tol, cg_max_iter, ftz_tol,
       order_q);
@@ -1719,7 +1725,9 @@ int main(int argc, char *argv[])
    // defines the Mult() method that used by the time integrators.
    ode_solver->Init(*hydro);
    hydro->ResetTimeStepEstimate();
-   double t = 0.0, dt = hydro->GetTimeStepEstimate(S), t_old;
+   double t = 0.0;
+   double dt = (fixed_dt > 0.0) ? fixed_dt : hydro->GetTimeStepEstimate(S);
+   double t_old;
    double next_interp_time = interp_dt;
    bool last_step = false;
    int steps = 0;
@@ -1826,23 +1834,26 @@ int main(int argc, char *argv[])
       ode_solver->Step(S, t, dt);
       steps++;
 
-      // Adaptive time step control.
-      const double dt_est = hydro->GetTimeStepEstimate(S);
-      if (dt_est < dt)
+      if (fixed_dt <= 0.0)
       {
-         // Repeat (solve again) with a decreased time step - decrease of the
-         // time estimate suggests appearance of oscillations.
-         dt *= 0.85;
-         if (dt < std::numeric_limits<double>::epsilon())
-         { MFEM_ABORT("The time step crashed!"); }
-         t = t_old;
-         S = S_old;
-         hydro->ResetQuadratureData();
-         if (Mpi::Root()) { cout << "Repeating step " << ti << endl; }
-         if (steps < max_tsteps) { last_step = false; }
-         ti--; continue;
+         // Adaptive time step control.
+         const double dt_est = hydro->GetTimeStepEstimate(S);
+         if (dt_est < dt)
+         {
+            // Repeat (solve again) with a decreased time step - decrease of the
+            // time estimate suggests appearance of oscillations.
+            dt *= 0.85;
+            if (dt < std::numeric_limits<double>::epsilon())
+            { MFEM_ABORT("The time step crashed!"); }
+            t = t_old;
+            S = S_old;
+            hydro->ResetQuadratureData();
+            if (Mpi::Root()) { cout << "Repeating step " << ti << endl; }
+            if (steps < max_tsteps) { last_step = false; }
+            ti--; continue;
+         }
+         else if (dt_est > 1.25 * dt) { dt *= 1.02; }
       }
-      else if (dt_est > 1.25 * dt) { dt *= 1.02; }
 
       // Ensure the sub-vectors x_gf, v_gf, and e_gf know the location of the
       // data in S. This operation simply updates the Memory validity flags of
@@ -2192,12 +2203,16 @@ int main(int argc, char *argv[])
                mat_gf, source, cfl,
                visc, vorticity, viscosity_const,
                use_conduction, prandtl_number,
+               freeze_momentum,
                p_assembly,
                cg_tol, cg_max_iter, ftz_tol,
                order_q);
             ode_solver->Init(*hydro);
             hydro->ResetTimeStepEstimate();
-            dt = hydro->GetTimeStepEstimate(S);
+            if (fixed_dt <= 0.0)
+            {
+               dt = hydro->GetTimeStepEstimate(S);
+            }
          }
       }
    }

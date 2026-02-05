@@ -119,6 +119,7 @@ protected:
    const double cfl;
    const bool use_viscosity, use_vorticity, p_assembly;
    bool use_conduction;
+   const bool freeze_momentum;
    const double viscosity_const;
    double prandtl_number;
    const double cg_rel_tol;
@@ -201,6 +202,7 @@ public:
                            const bool visc, const bool vort,
                            const double visc_const,
                            const bool cond, const double prandtl,
+                           const bool freeze_momentum,
                            const bool pa,
                            const double cgt, const int cgiter, double ftz_tol,
                            const int order_q);

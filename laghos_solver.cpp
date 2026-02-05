@@ -105,6 +105,7 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
                                                  const double visc_const,
                                                  const bool cond,
                                                  const double prandtl,
+                                                 const bool freeze_mom,
                                                  const bool p_assembly,
                                                  const double cgt,
                                                  const int cgiter,
@@ -130,6 +131,7 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    use_viscosity(visc),
    use_vorticity(vort),
    use_conduction(cond),
+   freeze_momentum(freeze_mom),
    viscosity_const(visc_const),
    prandtl_number(prandtl),
    p_assembly(p_assembly),
@@ -406,6 +408,13 @@ void LagrangianHydroOperator::Mult(const Vector &S, Vector &dS_dt) const
 void LagrangianHydroOperator::SolveVelocity(const Vector &S,
                                             Vector &dS_dt) const
 {
+   if (freeze_momentum)
+   {
+      ParGridFunction dv;
+      dv.MakeRef(&H1, dS_dt, H1Vsize);
+      dv = 0.0;
+      return;
+   }
    UpdateQuadratureData(S);
    AssembleForceMatrix();
    // The monolithic BlockVector stores the unknown fields as follows:
@@ -687,11 +696,10 @@ void LagrangianHydroOperator::UpdateConductionOperator(const Vector &S) const
 
    if (Mpi::Root() && t == 0.0)
    {
-      std::cout << "Conduction enabled: Pr = " << Pr 
-                << ", mu = " << mu 
+      std::cout << "Conduction enabled: Pr = " << Pr
+                << ", mu = " << mu
                 << ", gamma = " << gamma
-                << ", kappa = " << kappa 
-                << ", applied_coeff_e = " << kappa_e << std::endl;
+                << ", kappa = " << kappa_e << std::endl;
    }
 
    *u_cond_gf = kappa_e;
