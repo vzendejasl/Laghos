@@ -1684,6 +1684,10 @@ int main(int argc, char *argv[])
    VisItDataCollection visit_dc_debug("results_debug/Laghos", pmesh);
    if (visit)
    {
+      // Ensure quadrature data is current for diagnostics
+      double vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms;
+      hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms);
+
       // Compute Vorticity for t=0
       Diagnostics::ComputeCurl(v_gf, w_gf);
       Diagnostics::ComputeVortexStretching(v_gf, w_gf, w_stretch);
