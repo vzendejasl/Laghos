@@ -904,6 +904,8 @@ int main(int argc, char *argv[])
    double kappa_e = 0.0;
    bool use_conduction = false;
    double prandtl_number = 0.71;
+   bool cond_bdr = false;
+   double cond_flux = 0.0;
    bool visualization = false;
    int vis_steps = 5;
    bool visit = false;
@@ -978,6 +980,14 @@ int main(int argc, char *argv[])
                   "Enable or disable heat conduction.");
    args.AddOption(&prandtl_number, "-pr", "--prandtl",
                   "Prandtl number for heat conduction.");
+   args.AddOption(&cond_bdr, "-cond-bdr", "--cond-bdr", "-no-cond-bdr",
+                  "--no-cond-bdr",
+                  "Enable DG diffusion boundary term for conduction "
+                  "(homogeneous Dirichlet).");
+   args.AddOption(&cond_flux, "-cond-flux", "--cond-flux",
+                  "Constant heat flux q.n on the boundary (Neumann); "
+                  "requires -no-cond-bdr. Default is adiabatic when "
+                  "-no-cond-bdr and no flux is set.");
    args.AddOption(&visualization, "-vis", "--visualization", "-no-vis",
                   "--no-visualization",
                   "Enable or disable GLVis visualization.");
@@ -1031,6 +1041,15 @@ int main(int argc, char *argv[])
       return 1;
    }
    if (Mpi::Root()) { args.PrintOptions(cout); }
+
+   if (cond_bdr && cond_flux != 0.0)
+   {
+      MFEM_ABORT("cond_flux requires -no-cond-bdr (Dirichlet and flux are incompatible).");
+   }
+   if (cond_flux != 0.0 && !use_conduction)
+   {
+      MFEM_ABORT("cond_flux requires -cond.");
+   }
 
    const bool interp_cycle_on = interp_cycle > 0;
    const bool interp_time_on = interp_dt > 0.0;
@@ -1640,7 +1659,7 @@ int main(int argc, char *argv[])
       rho0_coeff, rho0_gf,
       mat_gf, source, cfl,
       visc, vorticity, viscosity_const,
-      use_conduction, prandtl_number,
+      use_conduction, prandtl_number, cond_bdr, cond_flux,
       freeze_momentum,
       p_assembly,
       cg_tol, cg_max_iter, ftz_tol,
@@ -2343,7 +2362,7 @@ int main(int argc, char *argv[])
                rho0_coeff, rho0_gf,
                mat_gf, source, cfl,
                visc, vorticity, viscosity_const,
-               use_conduction, prandtl_number,
+               use_conduction, prandtl_number, cond_bdr, cond_flux,
                freeze_momentum,
                p_assembly,
                cg_tol, cg_max_iter, ftz_tol,

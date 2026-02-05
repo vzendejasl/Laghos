@@ -105,6 +105,8 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
                                                  const double visc_const,
                                                  const bool cond,
                                                  const double prandtl,
+                                                 const bool cond_bdr_,
+                                                 const double cond_flux_,
                                                  const bool freeze_mom,
                                                  const bool p_assembly,
                                                  const double cgt,
@@ -131,6 +133,8 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    use_viscosity(visc),
    use_vorticity(vort),
    use_conduction(cond),
+   cond_bdr(cond_bdr_),
+   cond_flux(cond_flux_),
    freeze_momentum(freeze_mom),
    viscosity_const(visc_const),
    prandtl_number(prandtl),
@@ -174,7 +178,8 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    u_cond_gf(nullptr),
    cond_coeff(nullptr),
    sigma_cond(-1.0),
-   kappa_dg_cond(-1.0)
+   kappa_dg_cond(-1.0),
+   e_bdr_flux(nullptr)
 {
    if (use_conduction)
    {
@@ -383,6 +388,7 @@ LagrangianHydroOperator::~LagrangianHydroOperator()
    delete K_cond_bf;
    delete u_cond_gf;
    delete cond_coeff;
+   delete e_bdr_flux;
 }
 
 void LagrangianHydroOperator::Mult(const Vector &S, Vector &dS_dt) const
@@ -559,6 +565,7 @@ void LagrangianHydroOperator::SolveEnergy(const Vector &S, const Vector &v,
       LAGHOS_DEVICE_SYNC;
       timer.sw_force.Stop();
       if (e_source) { e_rhs += *e_source; }
+      if (e_bdr_flux) { e_rhs += *e_bdr_flux; }
 
       if (use_conduction)
       {
@@ -660,6 +667,7 @@ void LagrangianHydroOperator::SolveEnergy(const Vector &S, const Vector &v,
       LAGHOS_DEVICE_SYNC;
       timer.sw_force.Stop();
       if (e_source) { e_rhs += *e_source; }
+      if (e_bdr_flux) { e_rhs += *e_bdr_flux; }
       Vector loc_rhs(l2dofs_cnt), loc_de(l2dofs_cnt);
       for (int e = 0; e < NE; e++)
       {
@@ -718,10 +726,19 @@ void LagrangianHydroOperator::UpdateConductionOperator(const Vector &S) const
    K_cond_bf->AddDomainIntegrator(new DiffusionIntegrator(*cond_coeff));
    K_cond_bf->AddInteriorFaceIntegrator(
       new DGDiffusionIntegrator(*cond_coeff, sigma_cond, kappa_dg_cond));
-   if (pmesh->GetNBE() > 0)
+   if (cond_bdr && pmesh->GetNBE() > 0)
    {
-      //K_cond_bf->AddBdrFaceIntegrator(
-      //   new DGDiffusionIntegrator(*cond_coeff, sigma_cond, kappa_dg_cond));
+      K_cond_bf->AddBdrFaceIntegrator(
+         new DGDiffusionIntegrator(*cond_coeff, sigma_cond, kappa_dg_cond));
+   }
+
+   if (e_bdr_flux) { delete e_bdr_flux; e_bdr_flux = nullptr; }
+   if (!cond_bdr && cond_flux != 0.0 && pmesh->GetNBE() > 0)
+   {
+      e_bdr_flux = new ParLinearForm(&L2);
+      ConstantCoefficient flux_coeff(cond_flux);
+      e_bdr_flux->AddBdrFaceIntegrator(new BoundaryLFIntegrator(flux_coeff));
+      e_bdr_flux->Assemble();
    }
 
    K_cond_bf->Assemble();
