@@ -21,7 +21,13 @@ def run_laghos(rp, ok, ot):
         "-iv", "-diag", "output.txt", "-mach", "0.28",
         "-u0", "1.0", "-cfl", "0.2"
     ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"Executing: {' '.join(cmd)}")
+    # Use subprocess.Popen to stream output in real-time
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
+        for line in proc.stdout:
+            print(line, end='')
+    if proc.returncode != 0:
+        print(f"Error: Laghos exited with code {proc.returncode}")
 
 def get_rms_heat():
     if not os.path.exists("laghos_thermo.csv"):
