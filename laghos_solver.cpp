@@ -724,13 +724,16 @@ void LagrangianHydroOperator::UpdateConductionOperator(const Vector &S) const
       K_cond_bf->SetAssemblyLevel(AssemblyLevel::PARTIAL);
    }
    K_cond_bf->AddDomainIntegrator(new DiffusionIntegrator(*cond_coeff));
+   
    K_cond_bf->AddInteriorFaceIntegrator(
       new DGDiffusionIntegrator(*cond_coeff, sigma_cond, kappa_dg_cond));
+   
    if (cond_bdr && pmesh->GetNBE() > 0)
    {
       K_cond_bf->AddBdrFaceIntegrator(
          new DGDiffusionIntegrator(*cond_coeff, sigma_cond, kappa_dg_cond));
    }
+         
 
    if (e_bdr_flux) { delete e_bdr_flux; e_bdr_flux = nullptr; }
    if (!cond_bdr && cond_flux != 0.0 && pmesh->GetNBE() > 0)
@@ -740,6 +743,7 @@ void LagrangianHydroOperator::UpdateConductionOperator(const Vector &S) const
       e_bdr_flux->AddBdrFaceIntegrator(new BoundaryLFIntegrator(flux_coeff));
       e_bdr_flux->Assemble();
    }
+      
 
    K_cond_bf->Assemble();
    if (p_assembly)
@@ -2075,7 +2079,8 @@ MFEM_HOST_DEVICE inline void L2DiagQP(
     const double *grad_v,
     const double *v_quad,
     double &vol, double &rho_sum, double &temp_sum,
-    double &rho2, double &temp2, double &div2, double &cs2)
+    double &rho2, double &temp2, double &div2, double &cs2,
+    double &rho3, double &temp2_mw, double &div2_mw, double &cs2_mw)
 {
    constexpr int DIM2 = DIM*DIM;
    const int id = e*NQ + q;
@@ -2102,13 +2107,19 @@ MFEM_HOST_DEVICE inline void L2DiagQP(
    const double divu = Trace<DIM,DIM>(grad_phys);
 
    // ---- Accumulate ----
+   const double mass = rho * dV;
+
    vol      += dV;
-   rho_sum  += rho * dV;
-   temp_sum += T   * dV;
-   rho2     += rho*rho * dV;
-   temp2    += T*T     * dV;
-   div2     += divu*divu * dV;
-   cs2      += cs*cs   * dV;
+   rho_sum  += mass;
+   temp_sum += T * dV;
+   rho2     += rho * rho * dV;
+   temp2    += T * T * dV;
+   div2     += divu * divu * dV;
+   cs2      += cs * cs * dV;
+   rho3     += rho * rho * mass;
+   temp2_mw += T * T * mass;
+   div2_mw  += divu * divu * mass;
+   cs2_mw   += cs * cs * mass;
 }
 
 template<int DIM>
@@ -2121,12 +2132,13 @@ static inline void L2DiagKernelPA(
     const double *eq,
     const double *grad_v,
     const double *v_quad,
-    double *elem_out)   // size = NE * 7
+    double *elem_out)   // size = NE * 11
 {
    MFEM_FORALL(e, NE,
    {
       double vol=0.0, rho_sum=0.0, temp_sum=0.0;
       double rho2=0.0, temp2=0.0, div2=0.0, cs2=0.0;
+      double rho3=0.0, temp2_mw=0.0, div2_mw=0.0, cs2_mw=0.0;
 
       for (int q = 0; q < NQ; q++)
       {
@@ -2134,16 +2146,21 @@ static inline void L2DiagKernelPA(
                        gamma, weights, Jacs,
                        rho0DetJ0w, eq, grad_v, v_quad,
                        vol, rho_sum, temp_sum,
-                       rho2, temp2, div2, cs2);
+                       rho2, temp2, div2, cs2,
+                       rho3, temp2_mw, div2_mw, cs2_mw);
       }
 
-      elem_out[7*e + 0] = vol;
-      elem_out[7*e + 1] = rho_sum;
-      elem_out[7*e + 2] = temp_sum;
-      elem_out[7*e + 3] = rho2;
-      elem_out[7*e + 4] = temp2;
-      elem_out[7*e + 5] = div2;
-      elem_out[7*e + 6] = cs2;
+      elem_out[11*e + 0] = vol;
+      elem_out[11*e + 1] = rho_sum;
+      elem_out[11*e + 2] = temp_sum;
+      elem_out[11*e + 3] = rho2;
+      elem_out[11*e + 4] = temp2;
+      elem_out[11*e + 5] = div2;
+      elem_out[11*e + 6] = cs2;
+      elem_out[11*e + 7] = rho3;
+      elem_out[11*e + 8] = temp2_mw;
+      elem_out[11*e + 9] = div2_mw;
+      elem_out[11*e + 10] = cs2_mw;
    });
 }
 
@@ -2155,7 +2172,11 @@ void LagrangianHydroOperator::ComputeL2Diagnostics(
     double &rho_L2,
     double &temp_L2,
     double &divu_L2,
-    double &cs_L2) const
+    double &cs_L2,
+    double &rho_mw_L2,
+    double &temp_mw_L2,
+    double &divu_mw_L2,
+    double &cs_mw_L2) const
 {
    // Make sure quadrature data are current
    UpdateQuadratureData(S);
@@ -2164,7 +2185,7 @@ void LagrangianHydroOperator::ComputeL2Diagnostics(
    const int NQ = ir.GetNPoints();
 
    // Per-element partial sums (device-friendly)
-   Vector elem(NE * 7);
+   Vector elem(NE * 11);
    elem.UseDevice(true);
 
    // Dispatch kernel
@@ -2201,14 +2222,14 @@ void LagrangianHydroOperator::ComputeL2Diagnostics(
    elem.HostRead();
 
    // Local reductions
-   double loc[7] = {0,0,0,0,0,0,0};
+   double loc[11] = {0,0,0,0,0,0,0,0,0,0,0};
    for (int e = 0; e < NE; e++)
-      for (int k = 0; k < 7; k++)
-         loc[k] += elem[7*e + k];
+      for (int k = 0; k < 11; k++)
+         loc[k] += elem[11*e + k];
 
    // MPI reduction
-   double glob[7];
-   MPI_Allreduce(loc, glob, 7, MPI_DOUBLE, MPI_SUM, pmesh->GetComm());
+   double glob[11];
+   MPI_Allreduce(loc, glob, 11, MPI_DOUBLE, MPI_SUM, pmesh->GetComm());
 
    volume   = glob[0];
    rho_avg  = glob[1] / volume;
@@ -2217,6 +2238,12 @@ void LagrangianHydroOperator::ComputeL2Diagnostics(
    temp_L2  = sqrt(glob[4] / volume);
    divu_L2  = sqrt(glob[5] / volume);
    cs_L2    = sqrt(glob[6] / volume);
+
+   const double mass = glob[1];
+   rho_mw_L2  = (mass > 0.0) ? sqrt(glob[7] / mass) : 0.0;
+   temp_mw_L2 = (mass > 0.0) ? sqrt(glob[8] / mass) : 0.0;
+   divu_mw_L2 = (mass > 0.0) ? sqrt(glob[9] / mass) : 0.0;
+   cs_mw_L2   = (mass > 0.0) ? sqrt(glob[10] / mass) : 0.0;
 }
 
 } // namespace hydrodynamics

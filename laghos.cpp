@@ -1705,7 +1705,10 @@ int main(int argc, char *argv[])
    {
       // Ensure quadrature data is current for diagnostics
       double vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms;
-      hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms);
+      double r_rms_m, t_rms_m, d_rms_m, c_rms_m;
+      hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg,
+                                  r_rms, t_rms, d_rms, c_rms,
+                                  r_rms_m, t_rms_m, d_rms_m, c_rms_m);
 
       // Compute Vorticity for t=0
       Diagnostics::ComputeCurl(v_gf, w_gf);
@@ -1887,6 +1890,7 @@ int main(int argc, char *argv[])
    //   }
 
    std::ofstream csv_ofs;
+   std::ofstream csv_mw_ofs;
    if (Mpi::Root())
    {
       csv_ofs.open("laghos_thermo.csv");
@@ -1906,12 +1910,33 @@ int main(int argc, char *argv[])
               << "                  cs_rms" << std::endl;
       csv_ofs.precision(16);
       csv_ofs << std::scientific;
+
+      csv_mw_ofs.open("laghos_thermo_mass.csv");
+      csv_mw_ofs << "                    Time,"
+                 << "                   Cycle,"
+                 << "       InternalEnergyAvg,"
+                 << "            PressureWork,"
+                 << "             ViscousWork,"
+                 << "     HeatConductionPower,"
+                 << "  HeatConductionRMS_mass,"
+                 << " HeatConductionSurfaceFlux,"
+                 << "                 rho_avg,"
+                 << "                temp_avg,"
+                 << "             rho_rms_mass,"
+                 << "            temp_rms_mass,"
+                 << "           div_u_rms_mass,"
+                 << "              cs_rms_mass" << std::endl;
+      csv_mw_ofs.precision(16);
+      csv_mw_ofs << std::scientific;
    }
 
    // Initial L2 diagnostics for laghos_thermo.csv (cycle 0)
    {
       double vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms;
-      hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms);
+      double r_rms_m, t_rms_m, d_rms_m, c_rms_m;
+      hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg,
+                                  r_rms, t_rms, d_rms, c_rms,
+                                  r_rms_m, t_rms_m, d_rms_m, c_rms_m);
       
       double conduction_flux = 0.0;
       if (use_conduction && pmesh->GetNBE() > 0)
@@ -1934,7 +1959,9 @@ int main(int argc, char *argv[])
       if (Mpi::Root())
       {
          const double ie_avg = (vol > 0.0) ? internal_energy / vol : 0.0;
+         const double mass = r_avg * vol;
          const double h_con_rms = (vol > 0.0) ? sqrt(h_con_l2 / vol) : 0.0;
+         const double h_con_rms_m = (mass > 0.0) ? sqrt(h_con_l2 / mass) : 0.0;
 
          csv_ofs << std::setw(24) << 0.0 << ", "
                  << std::setw(24) << 0.0 << ", "
@@ -1950,6 +1977,24 @@ int main(int argc, char *argv[])
                  << std::setw(24) << t_rms << ", "
                  << std::setw(24) << d_rms << ", "
                  << std::setw(24) << c_rms << std::endl;
+
+         if (csv_mw_ofs.is_open())
+         {
+            csv_mw_ofs << std::setw(24) << 0.0 << ", "
+                       << std::setw(24) << 0.0 << ", "
+                       << std::setw(24) << ie_avg << ", "
+                       << std::setw(24) << p_dil << ", "
+                       << std::setw(24) << v_dis << ", "
+                       << std::setw(24) << h_con << ", "
+                       << std::setw(24) << h_con_rms_m << ", "
+                       << std::setw(24) << conduction_flux << ", "
+                       << std::setw(24) << r_avg << ", "
+                       << std::setw(24) << t_avg << ", "
+                       << std::setw(24) << r_rms_m << ", "
+                       << std::setw(24) << t_rms_m << ", "
+                       << std::setw(24) << d_rms_m << ", "
+                       << std::setw(24) << c_rms_m << std::endl;
+         }
       }
    }
 
@@ -2097,15 +2142,20 @@ int main(int argc, char *argv[])
       if (log_step)
       {
          double vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms;
-         hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms);
+         double r_rms_m, t_rms_m, d_rms_m, c_rms_m;
+         hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg,
+                                     r_rms, t_rms, d_rms, c_rms,
+                                     r_rms_m, t_rms_m, d_rms_m, c_rms_m);
          if (Mpi::Root())
          {
             const double ie_avg = internal_energy / vol;
+            const double mass = r_avg * vol;
             const double p_dil = hydro->GetSolveEnergyPressurePower();
             const double v_dis = hydro->GetSolveEnergyViscousPower();
             const double h_con = hydro->GetSolveEnergyConductionPower();
             const double h_con_l2 = hydro->GetSolveEnergyConductionL2();
             const double h_con_rms = (vol > 0.0) ? sqrt(h_con_l2 / vol) : 0.0;
+            const double h_con_rms_m = (mass > 0.0) ? sqrt(h_con_l2 / mass) : 0.0;
 
             csv_ofs << std::setw(24) << t << ", "
                     << std::setw(24) << static_cast<double>(ti) << ", "
@@ -2121,6 +2171,24 @@ int main(int argc, char *argv[])
                     << std::setw(24) << t_rms << ", "
                     << std::setw(24) << d_rms << ", "
                     << std::setw(24) << c_rms << std::endl;
+
+            if (csv_mw_ofs.is_open())
+            {
+               csv_mw_ofs << std::setw(24) << t << ", "
+                          << std::setw(24) << static_cast<double>(ti) << ", "
+                          << std::setw(24) << ie_avg << ", "
+                          << std::setw(24) << p_dil << ", "
+                          << std::setw(24) << v_dis << ", "
+                          << std::setw(24) << h_con << ", "
+                          << std::setw(24) << h_con_rms_m << ", "
+                          << std::setw(24) << conduction_flux << ", "
+                          << std::setw(24) << r_avg << ", "
+                          << std::setw(24) << t_avg << ", "
+                          << std::setw(24) << r_rms_m << ", "
+                          << std::setw(24) << t_rms_m << ", "
+                          << std::setw(24) << d_rms_m << ", "
+                          << std::setw(24) << c_rms_m << std::endl;
+            }
          }
       }
 
@@ -2432,7 +2500,10 @@ int main(int argc, char *argv[])
    }
 
    double vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms;
-   hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms);
+   double r_rms_m, t_rms_m, d_rms_m, c_rms_m;
+   hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg,
+                               r_rms, t_rms, d_rms, c_rms,
+                               r_rms_m, t_rms_m, d_rms_m, c_rms_m);
 
    if (Mpi::Root())
    {

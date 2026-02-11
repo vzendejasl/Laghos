@@ -236,7 +236,11 @@ public:
                              double &rho_L2,
                              double &temp_L2,
                              double &divu_L2,
-                             double &cs_L2) const;
+                             double &cs_L2,
+                             double &rho_mw_L2,
+                             double &temp_mw_L2,
+                             double &divu_mw_L2,
+                             double &cs_mw_L2) const;
 
    // The density values, which are stored only at some quadrature points,
    // are projected as a ParGridFunction.
