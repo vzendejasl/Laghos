@@ -240,7 +240,13 @@ public:
                              double &rho_mw_L2,
                              double &temp_mw_L2,
                              double &divu_mw_L2,
-                             double &cs_mw_L2) const;
+                             double &cs_mw_L2,
+                             double &mach_avg,
+                             double &mach_rms,
+                             double &mach_max,
+                             double &mach_avg_mw,
+                             double &mach_rms_mw,
+                             double &mach_min) const;
 
    // The density values, which are stored only at some quadrature points,
    // are projected as a ParGridFunction.

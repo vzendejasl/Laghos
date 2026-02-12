@@ -153,6 +153,47 @@ public:
    }
 };
 
+class SoundSpeedCoefficient : public Coefficient
+{
+protected:
+   const ParGridFunction *e_gf;
+   const ParGridFunction *gamma_gf;
+public:
+   SoundSpeedCoefficient(const ParGridFunction *e_gf_,
+                         const ParGridFunction *gamma_gf_)
+      : e_gf(e_gf_), gamma_gf(gamma_gf_) { }
+   virtual double Eval(ElementTransformation &T, const IntegrationPoint &ip)
+   {
+      const double e = e_gf->GetValue(T, ip);
+      const double g = gamma_gf->GetValue(T, ip);
+      return sqrt(g * (g - 1.0) * e);
+   }
+};
+
+class MachCoefficient : public Coefficient
+{
+protected:
+   const ParGridFunction *v_gf;
+   const ParGridFunction *e_gf;
+   const ParGridFunction *gamma_gf;
+   mutable Vector v;
+public:
+   MachCoefficient(const ParGridFunction *v_gf_,
+                   const ParGridFunction *e_gf_,
+                   const ParGridFunction *gamma_gf_,
+                   int dim)
+      : v_gf(v_gf_), e_gf(e_gf_), gamma_gf(gamma_gf_), v(dim) { }
+   virtual double Eval(ElementTransformation &T, const IntegrationPoint &ip)
+   {
+      v_gf->GetVectorValue(T, ip, v);
+      const double speed = v.Norml2();
+      const double e = e_gf->GetValue(T, ip);
+      const double g = gamma_gf->GetValue(T, ip);
+      const double cs = sqrt(g * (g - 1.0) * e);
+      return (cs > 0.0) ? (speed / cs) : 0.0;
+   }
+};
+
 void ComputeCurl(ParGridFunction &u, ParGridFunction &cu)
 {
    ParFiniteElementSpace *fes = u.ParFESpace();
@@ -1449,6 +1490,8 @@ int main(int argc, char *argv[])
    v_visc_gf = 0.0;
 
    ParGridFunction T_gf(&L2FESpace);
+   ParGridFunction cs_gf(&L2FESpace);
+   ParGridFunction mach_gf(&L2FESpace);
    T_gf = 0.0;
 
    // Integral of specific internal energy for problem 8 (heat conduction compare)
@@ -1601,6 +1644,8 @@ int main(int argc, char *argv[])
    ParGridFunction mat_gf(&mat_fes);
    FunctionCoefficient mat_coeff(gamma_func);
    mat_gf.ProjectCoefficient(mat_coeff);
+   Diagnostics::SoundSpeedCoefficient cs_coeff(&e_gf, &mat_gf);
+   Diagnostics::MachCoefficient mach_coeff(&v_gf, &e_gf, &mat_gf, dim);
 
    // Additional details, depending on the problem.
    int source = 0; bool visc = true, vorticity = false;
@@ -1706,9 +1751,17 @@ int main(int argc, char *argv[])
       // Ensure quadrature data is current for diagnostics
       double vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms;
       double r_rms_m, t_rms_m, d_rms_m, c_rms_m;
+      double mach_avg, mach_rms, mach_max, mach_avg_mw, mach_rms_mw;
+      double mach_min;
       hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg,
                                   r_rms, t_rms, d_rms, c_rms,
-                                  r_rms_m, t_rms_m, d_rms_m, c_rms_m);
+                                  r_rms_m, t_rms_m, d_rms_m, c_rms_m,
+                                  mach_avg, mach_rms, mach_max,
+                                  mach_avg_mw, mach_rms_mw,
+                                  mach_min);
+      (void)mach_min;
+      (void)mach_avg_mw;
+      (void)mach_rms_mw;
 
       // Compute Vorticity for t=0
       Diagnostics::ComputeCurl(v_gf, w_gf);
@@ -1746,11 +1799,15 @@ int main(int argc, char *argv[])
       T_gf = e_gf;
       // T = (gamma - 1) * e
       if (NE > 0) { T_gf *= (gamma_func(Vector({0.0})) - 1.0); }
+      cs_gf.ProjectCoefficient(cs_coeff);
+      mach_gf.ProjectCoefficient(mach_coeff);
 
       visit_dc.RegisterField("Density",  &rho_gf);
       visit_dc.RegisterField("Velocity", &v_gf);
       visit_dc.RegisterField("Specific Internal Energy", &e_gf);
       visit_dc.RegisterField("Temperature", &T_gf);
+      visit_dc.RegisterField("Sound Speed", &cs_gf);
+      visit_dc.RegisterField("Mach", &mach_gf);
       visit_dc.RegisterField("Vorticity", &w_gf);
       visit_dc.SetCycle(0);
       visit_dc.SetTime(0.0);
@@ -1807,7 +1864,8 @@ int main(int argc, char *argv[])
                << "         total_power,      pressure_power,"
                << "       viscous_power,  solve_total_power,"
                << " solve_pressure_power,  solve_viscous_power,"
-               << " solve_conduction_power" << std::endl;
+               << " solve_conduction_power,          mach_min,"
+               << "             mach_max" << std::endl;
    }
    ConstantCoefficient zero_coeff(0.0);
    const double mass0 = diag_output ? rho0_gf.ComputeL1Error(zero_coeff) : 0.0;
@@ -1843,6 +1901,16 @@ int main(int argc, char *argv[])
       const double internal_energy0 = hydro->InternalEnergy(e_gf);
       const double kinetic_energy0 = hydro->KineticEnergy(v_gf);
       const double enstrophy0 = ComputeEnstrophy(v_gf);
+      double vol0, r_avg0, t_avg0, r_rms0, t_rms0, d_rms0, c_rms0;
+      double r_rms_m0, t_rms_m0, d_rms_m0, c_rms_m0;
+      double mach_avg0, mach_rms0, mach_max0, mach_avg_mw0, mach_rms_mw0;
+      double mach_min0;
+      hydro->ComputeL2Diagnostics(S, vol0, r_avg0, t_avg0,
+                                  r_rms0, t_rms0, d_rms0, c_rms0,
+                                  r_rms_m0, t_rms_m0, d_rms_m0, c_rms_m0,
+                                  mach_avg0, mach_rms0, mach_max0,
+                                  mach_avg_mw0, mach_rms_mw0,
+                                  mach_min0);
       if (Mpi::Root())
       {
          const double solve_total_power0 = 0.0;
@@ -1863,7 +1931,9 @@ int main(int argc, char *argv[])
                   << solve_total_power0 << ","
                   << solve_pressure_power0 << ","
                   << solve_viscous_power0 << ","
-                  << solve_conduction_power0 << std::endl;
+                  << solve_conduction_power0 << ","
+                  << mach_min0 << ","
+                  << mach_max0 << std::endl;
       }
    }
 
@@ -1907,7 +1977,9 @@ int main(int argc, char *argv[])
               << "                 rho_rms,"
               << "                temp_rms,"
               << "               div_u_rms,"
-              << "                  cs_rms" << std::endl;
+              << "                  cs_rms,"
+              << "                mach_avg,"
+              << "                mach_rms" << std::endl;
       csv_ofs.precision(16);
       csv_ofs << std::scientific;
 
@@ -1925,7 +1997,9 @@ int main(int argc, char *argv[])
                  << "             rho_rms_mass,"
                  << "            temp_rms_mass,"
                  << "           div_u_rms_mass,"
-                 << "              cs_rms_mass" << std::endl;
+                 << "              cs_rms_mass,"
+                 << "            mach_avg_mass,"
+                 << "            mach_rms_mass" << std::endl;
       csv_mw_ofs.precision(16);
       csv_mw_ofs << std::scientific;
    }
@@ -1934,10 +2008,15 @@ int main(int argc, char *argv[])
    {
       double vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms;
       double r_rms_m, t_rms_m, d_rms_m, c_rms_m;
+      double mach_avg, mach_rms, mach_max, mach_avg_mw, mach_rms_mw;
+      double mach_min;
       hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg,
                                   r_rms, t_rms, d_rms, c_rms,
-                                  r_rms_m, t_rms_m, d_rms_m, c_rms_m);
-      
+                                  r_rms_m, t_rms_m, d_rms_m, c_rms_m,
+                                  mach_avg, mach_rms, mach_max,
+                                  mach_avg_mw, mach_rms_mw,
+                                  mach_min);
+      (void)mach_min;
       double conduction_flux = 0.0;
       if (use_conduction && pmesh->GetNBE() > 0)
       {
@@ -1976,7 +2055,9 @@ int main(int argc, char *argv[])
                  << std::setw(24) << r_rms << ", "
                  << std::setw(24) << t_rms << ", "
                  << std::setw(24) << d_rms << ", "
-                 << std::setw(24) << c_rms << std::endl;
+                 << std::setw(24) << c_rms << ", "
+                 << std::setw(24) << mach_avg << ", "
+                 << std::setw(24) << mach_rms << std::endl;
 
          if (csv_mw_ofs.is_open())
          {
@@ -1993,7 +2074,9 @@ int main(int argc, char *argv[])
                        << std::setw(24) << r_rms_m << ", "
                        << std::setw(24) << t_rms_m << ", "
                        << std::setw(24) << d_rms_m << ", "
-                       << std::setw(24) << c_rms_m << std::endl;
+                       << std::setw(24) << c_rms_m << ", "
+                       << std::setw(24) << mach_avg_mw << ", "
+                       << std::setw(24) << mach_rms_mw << std::endl;
          }
       }
    }
@@ -2059,6 +2142,8 @@ int main(int argc, char *argv[])
       double conduction_flux = 0.0;
       double enstrophy = 0.0;
       double e_integral = 0.0;
+      double mach_min = 0.0;
+      double mach_max = 0.0;
       if (log_step)
       {
          double lnorm = e_gf * e_gf, norm;
@@ -2143,9 +2228,16 @@ int main(int argc, char *argv[])
       {
          double vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms;
          double r_rms_m, t_rms_m, d_rms_m, c_rms_m;
+         double mach_avg, mach_rms, mach_avg_mw, mach_rms_mw;
+         double mach_max_local, mach_min_local;
          hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg,
                                      r_rms, t_rms, d_rms, c_rms,
-                                     r_rms_m, t_rms_m, d_rms_m, c_rms_m);
+                                     r_rms_m, t_rms_m, d_rms_m, c_rms_m,
+                                     mach_avg, mach_rms, mach_max_local,
+                                     mach_avg_mw, mach_rms_mw,
+                                     mach_min_local);
+         mach_min = mach_min_local;
+         mach_max = mach_max_local;
          if (Mpi::Root())
          {
             const double ie_avg = internal_energy / vol;
@@ -2170,7 +2262,9 @@ int main(int argc, char *argv[])
                     << std::setw(24) << r_rms << ", "
                     << std::setw(24) << t_rms << ", "
                     << std::setw(24) << d_rms << ", "
-                    << std::setw(24) << c_rms << std::endl;
+                    << std::setw(24) << c_rms << ", "
+                    << std::setw(24) << mach_avg << ", "
+                    << std::setw(24) << mach_rms << std::endl;
 
             if (csv_mw_ofs.is_open())
             {
@@ -2187,7 +2281,9 @@ int main(int argc, char *argv[])
                           << std::setw(24) << r_rms_m << ", "
                           << std::setw(24) << t_rms_m << ", "
                           << std::setw(24) << d_rms_m << ", "
-                          << std::setw(24) << c_rms_m << std::endl;
+                          << std::setw(24) << c_rms_m << ", "
+                          << std::setw(24) << mach_avg_mw << ", "
+                          << std::setw(24) << mach_rms_mw << std::endl;
             }
          }
       }
@@ -2224,7 +2320,9 @@ int main(int argc, char *argv[])
                      << solve_total_power << ","
                      << solve_pressure_power << ","
                      << solve_viscous_power << ","
-                     << solve_conduction_power << std::endl;
+                     << solve_conduction_power << ","
+                     << mach_min << ","
+                     << mach_max << std::endl;
          }
       }
 
@@ -2307,8 +2405,10 @@ int main(int argc, char *argv[])
             Wx += offx;
          }
 
-         if (visit)
-         {
+        if (visit)
+        {
+            cs_gf.ProjectCoefficient(cs_coeff);
+            mach_gf.ProjectCoefficient(mach_coeff);
             visit_dc.SetCycle(ti);
             visit_dc.SetTime(t);
             visit_dc.Save();
@@ -2501,9 +2601,17 @@ int main(int argc, char *argv[])
 
    double vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms;
    double r_rms_m, t_rms_m, d_rms_m, c_rms_m;
+   double mach_avg, mach_rms, mach_max, mach_avg_mw, mach_rms_mw;
+   double mach_min;
    hydro->ComputeL2Diagnostics(S, vol, r_avg, t_avg,
                                r_rms, t_rms, d_rms, c_rms,
-                               r_rms_m, t_rms_m, d_rms_m, c_rms_m);
+                               r_rms_m, t_rms_m, d_rms_m, c_rms_m,
+                               mach_avg, mach_rms, mach_max,
+                               mach_avg_mw, mach_rms_mw,
+                               mach_min);
+   (void)mach_avg_mw;
+   (void)mach_rms_mw;
+   (void)mach_min;
 
    if (Mpi::Root())
    {
@@ -2514,7 +2622,10 @@ int main(int argc, char *argv[])
       cout << "rho RMS   = " << r_rms << "\n";
       cout << "temp RMS  = " << t_rms << "\n";
       cout << "div u RMS = " << d_rms << "\n";
-      cout << "cs RMS    = " << c_rms << "\n\n";
+      cout << "cs RMS    = " << c_rms << "\n";
+      cout << "Mach avg  = " << mach_avg << "\n";
+      cout << "Mach RMS  = " << mach_rms << "\n";
+      cout << "Mach max  = " << mach_max << "\n\n";
    }
 
    // Free the used memory.
