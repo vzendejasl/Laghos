@@ -1427,6 +1427,9 @@ int main(int argc, char *argv[])
    ParGridFunction w_viscous; // Total Viscous Torque (Curl of a_visc)
    ParGridFunction w_visc_diff, w_visc_baro; // Viscous Diffusion & Viscous Baroclinic
    ParGridFunction work_p, work_tau, work_total, work_cond; // Work Diagnostic Fields
+   ParGridFunction work_p_h1;   // L2 -> H1 projection for visualization
+   ParGridFunction work_cond_h1; // L2 -> H1 projection for visualization
+   ParGridFunction work_cond_pa, work_cond_pa_h1; // PA-only conduction diagnostic
    ParGridFunction accel_gf; // Acceleration Field (RHS of Momentum)
    ParGridFunction accel_p, accel_tau; // Components of Acceleration
    ParGridFunction rho_h1, e_h1; // Intermediate H1 fields for baroclinic term
@@ -1470,10 +1473,18 @@ int main(int argc, char *argv[])
    work_tau.SetSpace(&L2FESpace);
    work_total.SetSpace(&L2FESpace);
    work_cond.SetSpace(&L2FESpace);
+   work_p_h1.SetSpace(&H1ScalarFESpace);
+   work_cond_h1.SetSpace(&H1ScalarFESpace);
+   work_cond_pa.SetSpace(&L2FESpace);
+   work_cond_pa_h1.SetSpace(&H1ScalarFESpace);
    work_p = 0.0;
    work_tau = 0.0;
    work_total = 0.0;
    work_cond = 0.0;
+   work_p_h1 = 0.0;
+   work_cond_h1 = 0.0;
+   work_cond_pa = 0.0;
+   work_cond_pa_h1 = 0.0;
 
    accel_gf.SetSpace(&H1FESpace);
    accel_gf = 0.0;
@@ -1775,6 +1786,12 @@ int main(int argc, char *argv[])
       
       double h_con_dummy, h_con_l2_dummy;
       hydro->ComputeConductionDiagnostics(S, h_con_dummy, h_con_l2_dummy, &work_cond);
+      double h_con_pa_dummy, h_con_pa_l2_dummy;
+      hydro->ComputeConductionDiagnosticsPA(S, h_con_pa_dummy, h_con_pa_l2_dummy,
+                                            &work_cond_pa);
+      Diagnostics::ProjectL2toH1(work_p, work_p_h1);
+      Diagnostics::ProjectL2toH1(work_cond, work_cond_h1);
+      Diagnostics::ProjectL2toH1(work_cond_pa, work_cond_pa_h1);
 
       hydro->ComputeAcceleration(accel_gf, &accel_p, &accel_tau);
 
@@ -1819,8 +1836,12 @@ int main(int argc, char *argv[])
       visit_dc_debug.RegisterField("VortexCompression", &w_compress);
       visit_dc_debug.RegisterField("BaroclinicTorque", &w_baroclinic);
       visit_dc_debug.RegisterField("WorkPressure", &work_p);
+      visit_dc_debug.RegisterField("WorkPressureH1", &work_p_h1);
       visit_dc_debug.RegisterField("WorkViscous", &work_tau);
       visit_dc_debug.RegisterField("WorkConduction", &work_cond);
+      visit_dc_debug.RegisterField("WorkConductionH1", &work_cond_h1);
+      visit_dc_debug.RegisterField("WorkConductionPA", &work_cond_pa);
+      visit_dc_debug.RegisterField("WorkConductionPAH1", &work_cond_pa_h1);
       visit_dc_debug.RegisterField("WorkTotal", &work_total);
       visit_dc_debug.RegisterField("Acceleration", &accel_gf);
       visit_dc_debug.RegisterField("AccelPressure", &accel_p);
@@ -1960,6 +1981,7 @@ int main(int argc, char *argv[])
    //   }
 
    std::ofstream csv_ofs;
+   std::ofstream csv_pa_ofs;
    std::ofstream csv_mw_ofs;
    if (Mpi::Root())
    {
@@ -1982,6 +2004,26 @@ int main(int argc, char *argv[])
               << "                mach_rms" << std::endl;
       csv_ofs.precision(16);
       csv_ofs << std::scientific;
+
+      csv_pa_ofs.open("laghos_thermo_pa.csv");
+      csv_pa_ofs << "                    Time,"
+                 << "                   Cycle,"
+                 << "       InternalEnergyAvg,"
+                 << "            PressureWork,"
+                 << "             ViscousWork,"
+                 << "     HeatConductionPower,"
+                 << "       HeatConductionRMS,"
+                 << " HeatConductionSurfaceFlux,"
+                 << "                 rho_avg,"
+                 << "                temp_avg,"
+                 << "                 rho_rms,"
+                 << "                temp_rms,"
+                 << "               div_u_rms,"
+                 << "                  cs_rms,"
+                 << "                mach_avg,"
+                 << "                mach_rms" << std::endl;
+      csv_pa_ofs.precision(16);
+      csv_pa_ofs << std::scientific;
 
       csv_mw_ofs.open("laghos_thermo_mass.csv");
       csv_mw_ofs << "                    Time,"
@@ -2034,6 +2076,10 @@ int main(int argc, char *argv[])
       double h_con = 0.0;
       double h_con_l2 = 0.0;
       hydro->ComputeConductionDiagnostics(S, h_con, h_con_l2, &work_cond);
+      double h_con_pa = 0.0;
+      double h_con_pa_l2 = 0.0;
+      hydro->ComputeConductionDiagnosticsPA(S, h_con_pa, h_con_pa_l2,
+                                            &work_cond_pa);
 
       if (Mpi::Root())
       {
@@ -2041,6 +2087,7 @@ int main(int argc, char *argv[])
          const double mass = r_avg * vol;
          const double h_con_rms = (vol > 0.0) ? sqrt(h_con_l2 / vol) : 0.0;
          const double h_con_rms_m = (mass > 0.0) ? sqrt(h_con_l2 / mass) : 0.0;
+         const double h_con_pa_rms = (vol > 0.0) ? sqrt(h_con_pa_l2 / vol) : 0.0;
 
          csv_ofs << std::setw(24) << 0.0 << ", "
                  << std::setw(24) << 0.0 << ", "
@@ -2058,6 +2105,26 @@ int main(int argc, char *argv[])
                  << std::setw(24) << c_rms << ", "
                  << std::setw(24) << mach_avg << ", "
                  << std::setw(24) << mach_rms << std::endl;
+
+         if (csv_pa_ofs.is_open())
+         {
+            csv_pa_ofs << std::setw(24) << 0.0 << ", "
+                       << std::setw(24) << 0.0 << ", "
+                       << std::setw(24) << ie_avg << ", "
+                       << std::setw(24) << p_dil << ", "
+                       << std::setw(24) << v_dis << ", "
+                       << std::setw(24) << h_con_pa << ", "
+                       << std::setw(24) << h_con_pa_rms << ", "
+                       << std::setw(24) << conduction_flux << ", "
+                       << std::setw(24) << r_avg << ", "
+                       << std::setw(24) << t_avg << ", "
+                       << std::setw(24) << r_rms << ", "
+                       << std::setw(24) << t_rms << ", "
+                       << std::setw(24) << d_rms << ", "
+                       << std::setw(24) << c_rms << ", "
+                       << std::setw(24) << mach_avg << ", "
+                       << std::setw(24) << mach_rms << std::endl;
+         }
 
          if (csv_mw_ofs.is_open())
          {
@@ -2248,6 +2315,11 @@ int main(int argc, char *argv[])
             const double h_con_l2 = hydro->GetSolveEnergyConductionL2();
             const double h_con_rms = (vol > 0.0) ? sqrt(h_con_l2 / vol) : 0.0;
             const double h_con_rms_m = (mass > 0.0) ? sqrt(h_con_l2 / mass) : 0.0;
+            double h_con_pa = 0.0;
+            double h_con_pa_l2 = 0.0;
+            hydro->ComputeConductionDiagnosticsPA(S, h_con_pa, h_con_pa_l2,
+                                                  &work_cond_pa);
+            const double h_con_pa_rms = (vol > 0.0) ? sqrt(h_con_pa_l2 / vol) : 0.0;
 
             csv_ofs << std::setw(24) << t << ", "
                     << std::setw(24) << static_cast<double>(ti) << ", "
@@ -2265,6 +2337,26 @@ int main(int argc, char *argv[])
                     << std::setw(24) << c_rms << ", "
                     << std::setw(24) << mach_avg << ", "
                     << std::setw(24) << mach_rms << std::endl;
+
+            if (csv_pa_ofs.is_open())
+            {
+               csv_pa_ofs << std::setw(24) << t << ", "
+                          << std::setw(24) << static_cast<double>(ti) << ", "
+                          << std::setw(24) << ie_avg << ", "
+                          << std::setw(24) << p_dil << ", "
+                          << std::setw(24) << v_dis << ", "
+                          << std::setw(24) << h_con_pa << ", "
+                          << std::setw(24) << h_con_pa_rms << ", "
+                          << std::setw(24) << conduction_flux << ", "
+                          << std::setw(24) << r_avg << ", "
+                          << std::setw(24) << t_avg << ", "
+                          << std::setw(24) << r_rms << ", "
+                          << std::setw(24) << t_rms << ", "
+                          << std::setw(24) << d_rms << ", "
+                          << std::setw(24) << c_rms << ", "
+                          << std::setw(24) << mach_avg << ", "
+                          << std::setw(24) << mach_rms << std::endl;
+            }
 
             if (csv_mw_ofs.is_open())
             {
@@ -2351,6 +2443,13 @@ int main(int argc, char *argv[])
             
             double h_con_dummy, h_con_l2_dummy;
             hydro->ComputeConductionDiagnostics(S, h_con_dummy, h_con_l2_dummy, &work_cond);
+            double h_con_pa_dummy, h_con_pa_l2_dummy;
+            hydro->ComputeConductionDiagnosticsPA(S, h_con_pa_dummy,
+                                                  h_con_pa_l2_dummy,
+                                                  &work_cond_pa);
+            Diagnostics::ProjectL2toH1(work_p, work_p_h1);
+            Diagnostics::ProjectL2toH1(work_cond, work_cond_h1);
+            Diagnostics::ProjectL2toH1(work_cond_pa, work_cond_pa_h1);
 
             hydro->ComputeAcceleration(accel_gf, &accel_p, &accel_tau);
 

@@ -96,6 +96,8 @@ public:
    void UpdateQuadratureData(const Vector &S, QuadratureData &qdata);
 };
 
+class ConductionPAOperator;
+
 // Given a solutions state (x, v, e), this class performs all necessary
 // computations to evaluate the new slopes (dx_dt, dv_dt, de_dt).
 class LagrangianHydroOperator : public TimeDependentOperator
@@ -136,6 +138,7 @@ protected:
    mutable GridFunctionCoefficient *cond_coeff;
    double sigma_cond, kappa_dg_cond;
    mutable ParLinearForm *e_bdr_flux;
+   mutable ConductionPAOperator *cond_pa_dbg;
    // Velocity mass matrix and local inverses of the energy mass matrices. These
    // are constant in time, due to the pointwise mass conservation property.
    mutable ParBilinearForm Mv;
@@ -260,6 +263,7 @@ public:
                           ParGridFunction &work_tau, ParGridFunction &work_total) const;
 
    void ComputeConductionDiagnostics(const Vector &S, double &h_con, double &h_con_rms, ParGridFunction *work_cond = nullptr) const;
+   void ComputeConductionDiagnosticsPA(const Vector &S, double &h_con, double &h_con_rms, ParGridFunction *work_cond = nullptr) const;
 
    double IntegrateL2Field(const Vector &z) const;
    double IntegrateL2FieldSquared(const Vector &z) const;
@@ -281,6 +285,31 @@ public:
    double GetSolveEnergyConductionL2() const { return solve_conduction_l2; }
    double GetSolveEnergyTotalPower() const { return solve_total_power; }
    bool HasSolveEnergyPower() const { return solve_power_valid; }
+};
+
+class ConductionPAOperator
+{
+private:
+   ParFiniteElementSpace &L2;
+   ParBilinearForm *K_bf;
+   OperatorHandle K;
+   ParGridFunction u_gf;
+   GridFunctionCoefficient u_coeff;
+   double sigma, kappa_dg;
+   MassPAOperator *M;
+   mutable CGSolver cg;
+
+public:
+   ConductionPAOperator(ParFiniteElementSpace &l2_fes,
+                        const IntegrationRule &ir,
+                        Coefficient &rho0_coeff,
+                        const double cg_rel_tol,
+                        const int cg_max_iter);
+   ~ConductionPAOperator();
+
+   void UpdateCoefficient(const ParGridFunction &coeff_gf);
+   void Assemble();
+   void ComputeDeCond(const Vector &e, Vector &de_cond) const;
 };
 
 // TaylorCoefficient used in the 2D Taylor-Green problem.
