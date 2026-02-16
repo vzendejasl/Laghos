@@ -2305,6 +2305,10 @@ int main(int argc, char *argv[])
                                      mach_min_local);
          mach_min = mach_min_local;
          mach_max = mach_max_local;
+         double h_con_pa = 0.0;
+         double h_con_pa_l2 = 0.0;
+         hydro->ComputeConductionDiagnosticsPA(S, h_con_pa, h_con_pa_l2,
+                                               &work_cond_pa);
          if (Mpi::Root())
          {
             const double ie_avg = internal_energy / vol;
@@ -2315,10 +2319,6 @@ int main(int argc, char *argv[])
             const double h_con_l2 = hydro->GetSolveEnergyConductionL2();
             const double h_con_rms = (vol > 0.0) ? sqrt(h_con_l2 / vol) : 0.0;
             const double h_con_rms_m = (mass > 0.0) ? sqrt(h_con_l2 / mass) : 0.0;
-            double h_con_pa = 0.0;
-            double h_con_pa_l2 = 0.0;
-            hydro->ComputeConductionDiagnosticsPA(S, h_con_pa, h_con_pa_l2,
-                                                  &work_cond_pa);
             const double h_con_pa_rms = (vol > 0.0) ? sqrt(h_con_pa_l2 / vol) : 0.0;
 
             csv_ofs << std::setw(24) << t << ", "

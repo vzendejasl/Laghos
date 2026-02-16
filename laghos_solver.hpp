@@ -131,14 +131,10 @@ protected:
    const double ftz_tol;
    const ParGridFunction &gamma_gf;
 
-   // DG Conduction operators
-   mutable ParBilinearForm *K_cond_bf;
-   mutable OperatorHandle K_cond;
-   mutable ParGridFunction *u_cond_gf;
-   mutable GridFunctionCoefficient *cond_coeff;
-   double sigma_cond, kappa_dg_cond;
+   // DG Conduction operator (PA-only, rebuilt each step)
+   mutable ConductionPAOperator *cond_op;
+   mutable ParGridFunction *cond_coeff_gf;
    mutable ParLinearForm *e_bdr_flux;
-   mutable ConductionPAOperator *cond_pa_dbg;
    // Velocity mass matrix and local inverses of the energy mass matrices. These
    // are constant in time, due to the pointwise mass conservation property.
    mutable ParBilinearForm Mv;
@@ -193,6 +189,8 @@ protected:
 
    void UpdateQuadratureData(const Vector &S) const;
    void AssembleForceMatrix() const;
+   void ComputeConductionPostprocess(const Vector &S, Vector &de_cond,
+                                     Vector *cond_rhs = nullptr) const;
 
 public:
    LagrangianHydroOperator(const int size,
@@ -307,9 +305,8 @@ public:
                         const int cg_max_iter);
    ~ConductionPAOperator();
 
-   void UpdateCoefficient(const ParGridFunction &coeff_gf);
-   void Assemble();
-   void ComputeDeCond(const Vector &e, Vector &de_cond) const;
+   void Apply(const ParGridFunction &coeff_gf, const Vector &e,
+              Vector &de_cond, Vector *k_e = nullptr);
 };
 
 // TaylorCoefficient used in the 2D Taylor-Green problem.

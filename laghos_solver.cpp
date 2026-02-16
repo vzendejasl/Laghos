@@ -174,26 +174,18 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    solve_power_valid(false),
    rhs_c_gf(&H1c),
    dvc_gf(&H1c),
-   K_cond_bf(nullptr),
-   u_cond_gf(nullptr),
-   cond_coeff(nullptr),
-   sigma_cond(-1.0),
-   kappa_dg_cond(-1.0),
-   e_bdr_flux(nullptr),
-   cond_pa_dbg(nullptr)
+   cond_op(nullptr),
+   cond_coeff_gf(nullptr),
+   e_bdr_flux(nullptr)
 {
    if (use_conduction)
    {
-      sigma_cond = -1.0;
-      kappa_dg_cond = (L2.GetOrder(0) + 1) * (L2.GetOrder(0) + 1);
-
-      u_cond_gf = new ParGridFunction(&L2);
-      cond_coeff = new GridFunctionCoefficient(u_cond_gf);
       if (p_assembly)
       {
-         cond_pa_dbg = new ConductionPAOperator(L2, ir, rho0_coeff,
-                                                cg_rel_tol, cg_max_iter);
+         cond_op = new ConductionPAOperator(L2, ir, rho0_coeff,
+                                            cg_rel_tol, cg_max_iter);
       }
+      cond_coeff_gf = new ParGridFunction(&L2);
    }
 
    // Initialize new pressure and viscous tensors to zero on device
@@ -391,11 +383,9 @@ LagrangianHydroOperator::~LagrangianHydroOperator()
       delete ForcePA_pressure;
       delete ForcePA_viscous;
    }
-   delete K_cond_bf;
-   delete u_cond_gf;
-   delete cond_coeff;
    delete e_bdr_flux;
-   delete cond_pa_dbg;
+   delete cond_op;
+   delete cond_coeff_gf;
 }
 
 void LagrangianHydroOperator::Mult(const Vector &S, Vector &dS_dt) const
@@ -537,11 +527,6 @@ void LagrangianHydroOperator::SolveEnergy(const Vector &S, const Vector &v,
    UpdateQuadratureData(S);
    AssembleForceMatrix();
 
-   if (use_conduction)
-   {
-      UpdateConductionOperator(S);
-   }
-
    // The monolithic BlockVector stores the unknown fields as follows:
    // (Position, Velocity, Specific Internal Energy).
    ParGridFunction de;
@@ -577,20 +562,11 @@ void LagrangianHydroOperator::SolveEnergy(const Vector &S, const Vector &v,
       if (use_conduction)
       {
          // Apply conduction: e_rhs -= K_cond * e
-         Vector e_vec;
-         e_vec.MakeRef(const_cast<Vector&>(S), block_offsets[2], L2Vsize);
-         MFEM_VERIFY(K_cond.Ptr() != nullptr, "K_cond operator is null.");
-         MFEM_VERIFY(K_cond->Width() == L2Vsize,
-                     "K_cond expects true dofs; size mismatch.");
          Vector cond_rhs(L2Vsize);
          cond_rhs.UseDevice(true);
-         K_cond->Mult(e_vec, cond_rhs);
-         e_rhs.Add(-1.0, cond_rhs);
-
-         // Compute conduction power: M_e * de_cond = -K_cond * e
          Vector de_cond(L2Vsize);
-         Vector neg_cond_rhs(cond_rhs); neg_cond_rhs.Neg();
-         CG_EMass.Mult(neg_cond_rhs, de_cond);
+         ComputeConductionPostprocess(S, de_cond, &cond_rhs);
+         e_rhs.Add(-1.0, cond_rhs);
          solve_conduction_power = IntegrateL2Field(de_cond);
          solve_conduction_l2 = IntegrateL2FieldSquared(de_cond);
       }
@@ -722,9 +698,14 @@ void LagrangianHydroOperator::UpdateConductionOperator(const Vector &S) const
                 << ", kappa = " << kappa_e << std::endl;
    }
 
+   if (!p_assembly || cond_op == nullptr || cond_coeff_gf == nullptr)
+   {
+      return;
+   }
+
    if (kappa_e == 0.0)
    {
-      *u_cond_gf = 0.0;
+      *cond_coeff_gf = 0.0;
    }
    else
    {
@@ -732,35 +713,14 @@ void LagrangianHydroOperator::UpdateConductionOperator(const Vector &S) const
       ParGridFunction rho_gf(&L2);
       ComputeDensity(rho_gf);
 
-      u_cond_gf->HostWrite();
+      cond_coeff_gf->HostWrite();
       rho_gf.HostRead();
-      for (int i = 0; i < u_cond_gf->Size(); i++)
+      for (int i = 0; i < cond_coeff_gf->Size(); i++)
       {
          const double rho = rho_gf(i);
-         (*u_cond_gf)(i) = (rho > 0.0) ? (kappa_e / rho) : 0.0;
+         (*cond_coeff_gf)(i) = (rho > 0.0) ? (kappa_e / rho) : 0.0;
       }
    }
-   u_cond_gf->ExchangeFaceNbrData();
-
-   // Create a fresh operator to handle changing mesh coordinates.
-   K_cond.Clear();
-   delete K_cond_bf;
-   K_cond_bf = new ParBilinearForm(&L2);
-   if (p_assembly)
-   {
-      K_cond_bf->SetAssemblyLevel(AssemblyLevel::PARTIAL);
-   }
-   K_cond_bf->AddDomainIntegrator(new DiffusionIntegrator(*cond_coeff));
-   
-   K_cond_bf->AddInteriorFaceIntegrator(
-      new DGDiffusionIntegrator(*cond_coeff, sigma_cond, kappa_dg_cond));
-
-   if (cond_bdr && pmesh->GetNBE() > 0)
-   {
-      K_cond_bf->AddBdrFaceIntegrator(
-         new DGDiffusionIntegrator(*cond_coeff, sigma_cond, kappa_dg_cond));
-   }
-         
 
    if (e_bdr_flux) { delete e_bdr_flux; e_bdr_flux = nullptr; }
    if (!cond_bdr && cond_flux != 0.0 && pmesh->GetNBE() > 0)
@@ -770,20 +730,37 @@ void LagrangianHydroOperator::UpdateConductionOperator(const Vector &S) const
       e_bdr_flux->AddBdrFaceIntegrator(new BoundaryLFIntegrator(flux_coeff));
       e_bdr_flux->Assemble();
    }
-      
 
-   K_cond_bf->Assemble();
-   if (p_assembly)
+   // Operator assembly is triggered by a single Apply call downstream.
+}
+
+void LagrangianHydroOperator::ComputeConductionPostprocess(const Vector &S,
+                                                           Vector &de_cond,
+                                                           Vector *cond_rhs) const
+{
+   de_cond.SetSize(L2Vsize);
+   de_cond.UseDevice(true);
+   if (cond_rhs)
    {
-      K_cond.Reset(K_cond_bf, false);
+      cond_rhs->SetSize(L2Vsize);
+      cond_rhs->UseDevice(true);
    }
-   else
+
+   if (!use_conduction || !p_assembly)
    {
-      K_cond_bf->Finalize();
-      K_cond.Reset(K_cond_bf->ParallelAssemble(), true);
-      delete K_cond_bf;
-      K_cond_bf = nullptr;
+      de_cond = 0.0;
+      if (cond_rhs) { *cond_rhs = 0.0; }
+      return;
    }
+
+   UpdateConductionOperator(S);
+
+   Vector e_vec;
+   e_vec.MakeRef(const_cast<Vector&>(S), block_offsets[2], L2Vsize);
+
+   MFEM_VERIFY(cond_op != nullptr, "Conduction operator is null.");
+   MFEM_VERIFY(cond_coeff_gf != nullptr, "Conduction coefficient is null.");
+   cond_op->Apply(*cond_coeff_gf, e_vec, de_cond, cond_rhs);
 }
 
 double LagrangianHydroOperator::GetTimeStepEstimate(const Vector &S) const
@@ -1083,19 +1060,8 @@ double LagrangianHydroOperator::ComputeConductionWork(const Vector &S,
 {
    if (!use_conduction) { return 0.0; }
 
-   // Ensure mesh and conduction operator are consistent with S.
-   UpdateMesh(S);
-   UpdateConductionOperator(S);
-
-   Vector e_vec;
-   e_vec.MakeRef(const_cast<Vector&>(S), block_offsets[2], L2Vsize);
-   Vector cond_rhs(L2Vsize);
-   cond_rhs.UseDevice(true);
-   K_cond->Mult(e_vec, cond_rhs);
-
    Vector de_cond(L2Vsize);
-   Vector neg_cond_rhs(cond_rhs); neg_cond_rhs.Neg();
-   CG_EMass.Mult(neg_cond_rhs, de_cond);
+   ComputeConductionPostprocess(S, de_cond, nullptr);
 
    const double conduction_power = IntegrateL2Field(de_cond);
    return conduction_power * dt;
@@ -1151,36 +1117,20 @@ void LagrangianHydroOperator::ComputeConductionDiagnostics(const Vector &S, doub
 
    if (p_assembly)
    {
-       UpdateQuadratureData(S);
-       UpdateConductionOperator(S);
+      Vector de_cond(L2Vsize);
+      ComputeConductionPostprocess(S, de_cond, nullptr);
 
-       // Apply conduction: K_cond * e
-       Vector e_vec;
-       e_vec.MakeRef(const_cast<Vector&>(S), block_offsets[2], L2Vsize);
-       
-       Vector cond_rhs(L2Vsize);
-       cond_rhs.UseDevice(true);
-       
-       // We need M_e * de_cond = -K_cond * e
-       K_cond->Mult(e_vec, cond_rhs);
-       
-       Vector de_cond(L2Vsize);
-       Vector neg_cond_rhs(cond_rhs); 
-       neg_cond_rhs.Neg();
-       
-       CG_EMass.Mult(neg_cond_rhs, de_cond);
-       
-       h_con = IntegrateL2Field(de_cond);
-       h_con_rms = IntegrateL2FieldSquared(de_cond);
-       
-       if (work_cond)
-       {
-           *work_cond = de_cond;
-       }
-       
-       // Also update the internal member variables
-       solve_conduction_power = h_con;
-       solve_conduction_l2 = h_con_rms;
+      h_con = IntegrateL2Field(de_cond);
+      h_con_rms = IntegrateL2FieldSquared(de_cond);
+
+      if (work_cond)
+      {
+         *work_cond = de_cond;
+      }
+
+      // Also update the internal member variables
+      solve_conduction_power = h_con;
+      solve_conduction_l2 = h_con_rms;
    }
 }
 
@@ -1189,50 +1139,7 @@ void LagrangianHydroOperator::ComputeConductionDiagnosticsPA(const Vector &S,
                                                              double &h_con_rms,
                                                              ParGridFunction *work_cond) const
 {
-   h_con = 0.0;
-   h_con_rms = 0.0;
-   if (work_cond) { *work_cond = 0.0; }
-
-   if (!use_conduction || !p_assembly || cond_pa_dbg == nullptr) { return; }
-
-   UpdateQuadratureData(S);
-
-   const double Pr = prandtl_number;
-   double local_gamma = 0.0;
-   if (gamma_gf.Size() > 0) { local_gamma = gamma_gf(0); }
-   double gamma;
-   MPI_Allreduce(&local_gamma, &gamma, 1, MPI_DOUBLE, MPI_MAX, H1.GetComm());
-
-   const double mu = (viscosity_const >= 0.0) ? viscosity_const : 0.0;
-   const double kappa_e = mu * gamma / Pr;
-
-   ParGridFunction rho_gf(&L2);
-   ComputeDensity(rho_gf);
-
-   ParGridFunction coeff_gf(&L2);
-   coeff_gf.HostWrite();
-   rho_gf.HostRead();
-   for (int i = 0; i < coeff_gf.Size(); i++)
-   {
-      const double rho = rho_gf(i);
-      coeff_gf(i) = (rho > 0.0) ? (kappa_e / rho) : 0.0;
-   }
-
-   cond_pa_dbg->UpdateCoefficient(coeff_gf);
-   cond_pa_dbg->Assemble();
-
-   Vector e_vec;
-   e_vec.MakeRef(const_cast<Vector&>(S), block_offsets[2], L2Vsize);
-
-   Vector de_cond(L2Vsize);
-   cond_pa_dbg->ComputeDeCond(e_vec, de_cond);
-
-   h_con = IntegrateL2Field(de_cond);
-   h_con_rms = IntegrateL2FieldSquared(de_cond);
-   if (work_cond)
-   {
-      *work_cond = de_cond;
-   }
+   ComputeConductionDiagnostics(S, h_con, h_con_rms, work_cond);
 }
 
 void LagrangianHydroOperator::ComputeAcceleration(Vector &accel,
@@ -2397,6 +2304,7 @@ ConductionPAOperator::ConductionPAOperator(ParFiniteElementSpace &l2_fes,
      cg(L2.GetParMesh()->GetComm())
 {
    cg.SetOperator(*M);
+   cg.iterative_mode = false;
    cg.SetRelTol(cg_rel_tol);
    cg.SetAbsTol(0.0);
    cg.SetMaxIter(cg_max_iter);
@@ -2409,14 +2317,15 @@ ConductionPAOperator::~ConductionPAOperator()
    delete M;
 }
 
-void ConductionPAOperator::UpdateCoefficient(const ParGridFunction &coeff_gf)
+void ConductionPAOperator::Apply(const ParGridFunction &coeff_gf,
+                                 const Vector &e, Vector &de_cond,
+                                 Vector *k_e)
 {
+   // Update coefficient field.
    u_gf = coeff_gf;
    u_gf.ExchangeFaceNbrData();
-}
 
-void ConductionPAOperator::Assemble()
-{
+   // Assemble the diffusion operator.
    K.Clear();
    delete K_bf;
    K_bf = new ParBilinearForm(&L2);
@@ -2426,17 +2335,27 @@ void ConductionPAOperator::Assemble()
       new DGDiffusionIntegrator(u_coeff, sigma, kappa_dg));
    K_bf->Assemble();
    K.Reset(K_bf, false);
-}
 
-void ConductionPAOperator::ComputeDeCond(const Vector &e,
-                                         Vector &de_cond) const
-{
    MFEM_VERIFY(K.Ptr() != nullptr, "Conduction operator is null.");
-   Vector cond_rhs(L2.GetVSize());
-   cond_rhs.UseDevice(true);
-   K->Mult(e, cond_rhs);
-   cond_rhs.Neg();
-   cg.Mult(cond_rhs, de_cond);
+
+   Vector *k = k_e;
+   Vector k_tmp;
+   if (!k)
+   {
+      k_tmp.SetSize(L2.GetVSize());
+      k_tmp.UseDevice(true);
+      k = &k_tmp;
+   }
+   else
+   {
+      k->SetSize(L2.GetVSize());
+      k->UseDevice(true);
+   }
+
+   K->Mult(e, *k);
+   Vector neg_k(*k);
+   neg_k.Neg();
+   cg.Mult(neg_k, de_cond);
 }
 
 } // namespace hydrodynamics
