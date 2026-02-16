@@ -96,7 +96,6 @@ public:
    void UpdateQuadratureData(const Vector &S, QuadratureData &qdata);
 };
 
-class ConductionPAOperator;
 
 // Given a solutions state (x, v, e), this class performs all necessary
 // computations to evaluate the new slopes (dx_dt, dv_dt, de_dt).
@@ -129,11 +128,10 @@ protected:
    const double cg_rel_tol;
    const int cg_max_iter;
    const double ftz_tol;
+   Coefficient &rho0_coeff;
    const ParGridFunction &gamma_gf;
 
-   // DG Conduction operator (PA-only, rebuilt each step)
-   mutable ConductionPAOperator *cond_op;
-   mutable ParGridFunction *cond_coeff_gf;
+   // DG Conduction operator post-processing (standalone function call)
    mutable ParLinearForm *e_bdr_flux;
    // Velocity mass matrix and local inverses of the energy mass matrices. These
    // are constant in time, due to the pointwise mass conservation property.
@@ -283,30 +281,6 @@ public:
    double GetSolveEnergyConductionL2() const { return solve_conduction_l2; }
    double GetSolveEnergyTotalPower() const { return solve_total_power; }
    bool HasSolveEnergyPower() const { return solve_power_valid; }
-};
-
-class ConductionPAOperator
-{
-private:
-   ParFiniteElementSpace &L2;
-   ParBilinearForm *K_bf;
-   OperatorHandle K;
-   ParGridFunction u_gf;
-   GridFunctionCoefficient u_coeff;
-   double sigma, kappa_dg;
-   MassPAOperator *M;
-   mutable CGSolver cg;
-
-public:
-   ConductionPAOperator(ParFiniteElementSpace &l2_fes,
-                        const IntegrationRule &ir,
-                        Coefficient &rho0_coeff,
-                        const double cg_rel_tol,
-                        const int cg_max_iter);
-   ~ConductionPAOperator();
-
-   void Apply(const ParGridFunction &coeff_gf, const Vector &e,
-              Vector &de_cond, Vector *k_e = nullptr);
 };
 
 // TaylorCoefficient used in the 2D Taylor-Green problem.
