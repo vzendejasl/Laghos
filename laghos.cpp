@@ -1842,6 +1842,8 @@ int main(int argc, char *argv[])
       visit_dc_debug.RegisterField("WorkConductionH1", &work_cond_h1);
       visit_dc_debug.RegisterField("WorkConductionPA", &work_cond_pa);
       visit_dc_debug.RegisterField("WorkConductionPAH1", &work_cond_pa_h1);
+      visit_dc_debug.RegisterField("de_cond_main", &work_cond);
+      visit_dc_debug.RegisterField("de_cond_post", &work_cond_pa);
       visit_dc_debug.RegisterField("WorkTotal", &work_total);
       visit_dc_debug.RegisterField("Acceleration", &accel_gf);
       visit_dc_debug.RegisterField("AccelPressure", &accel_p);

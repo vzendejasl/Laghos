@@ -558,15 +558,18 @@ void LagrangianHydroOperator::SolveEnergy(const Vector &S, const Vector &v,
       if (use_conduction)
       {
          // Apply conduction: e_rhs -= K_cond * e
-         Vector e_vec;
-         e_vec.MakeRef(const_cast<Vector&>(S), block_offsets[2], L2Vsize);
          Vector cond_rhs(L2Vsize);
          cond_rhs.UseDevice(true);
-         Vector de_cond(L2Vsize);
-         ComputeConductionPostprocess(S, de_cond, &cond_rhs);
+         Vector de_cond_tmp(L2Vsize);
+         ComputeConductionPostprocess(S, de_cond_tmp, &cond_rhs);
          e_rhs.Add(-1.0, cond_rhs);
-         solve_conduction_power = IntegrateL2Field(de_cond);
-         solve_conduction_l2 = IntegrateL2FieldSquared(de_cond);
+         Vector neg_cond_rhs(cond_rhs);
+         neg_cond_rhs.Neg();
+         Vector de_cond_main(L2Vsize);
+         de_cond_main.UseDevice(true);
+         CG_EMass.Mult(neg_cond_rhs, de_cond_main);
+         solve_conduction_power = IntegrateL2Field(de_cond_main);
+         solve_conduction_l2 = IntegrateL2FieldSquared(de_cond_main);
       }
       else { solve_conduction_power = 0.0; solve_conduction_l2 = 0.0; }
 
@@ -1152,15 +1155,21 @@ void LagrangianHydroOperator::ComputeConductionDiagnostics(const Vector &S, doub
 
    if (p_assembly)
    {
-      Vector de_cond(L2Vsize);
-      ComputeConductionPostprocess(S, de_cond, nullptr);
+      Vector de_cond_tmp(L2Vsize), cond_rhs(L2Vsize);
+      ComputeConductionPostprocess(S, de_cond_tmp, &cond_rhs);
 
-      h_con = IntegrateL2Field(de_cond);
-      h_con_rms = IntegrateL2FieldSquared(de_cond);
+      Vector neg_cond_rhs(cond_rhs);
+      neg_cond_rhs.Neg();
+      Vector de_cond_main(L2Vsize);
+      de_cond_main.UseDevice(true);
+      CG_EMass.Mult(neg_cond_rhs, de_cond_main);
+
+      h_con = IntegrateL2Field(de_cond_main);
+      h_con_rms = IntegrateL2FieldSquared(de_cond_main);
 
       if (work_cond)
       {
-         *work_cond = de_cond;
+         *work_cond = de_cond_main;
       }
 
       // Also update the internal member variables
@@ -1174,7 +1183,20 @@ void LagrangianHydroOperator::ComputeConductionDiagnosticsPA(const Vector &S,
                                                              double &h_con_rms,
                                                              ParGridFunction *work_cond) const
 {
-   ComputeConductionDiagnostics(S, h_con, h_con_rms, work_cond);
+   h_con = 0.0;
+   h_con_rms = 0.0;
+   if (work_cond) { *work_cond = 0.0; }
+
+   if (!use_conduction || !p_assembly) { return; }
+
+   Vector de_cond(L2Vsize);
+   ComputeConductionPostprocess(S, de_cond, nullptr);
+   h_con = IntegrateL2Field(de_cond);
+   h_con_rms = IntegrateL2FieldSquared(de_cond);
+   if (work_cond)
+   {
+      *work_cond = de_cond;
+   }
 }
 
 void LagrangianHydroOperator::ComputeAcceleration(Vector &accel,
