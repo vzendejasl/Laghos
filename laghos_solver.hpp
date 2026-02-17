@@ -96,6 +96,7 @@ public:
    void UpdateQuadratureData(const Vector &S, QuadratureData &qdata);
 };
 
+
 // Given a solutions state (x, v, e), this class performs all necessary
 // computations to evaluate the new slopes (dx_dt, dv_dt, de_dt).
 class LagrangianHydroOperator : public TimeDependentOperator
@@ -127,14 +128,10 @@ protected:
    const double cg_rel_tol;
    const int cg_max_iter;
    const double ftz_tol;
+   Coefficient &rho0_coeff;
    const ParGridFunction &gamma_gf;
 
-   // DG Conduction operators
-   mutable ParBilinearForm *K_cond_bf;
-   mutable OperatorHandle K_cond;
-   mutable ParGridFunction *u_cond_gf;
-   mutable GridFunctionCoefficient *cond_coeff;
-   double sigma_cond, kappa_dg_cond;
+   // DG Conduction operator post-processing (standalone function call)
    mutable ParLinearForm *e_bdr_flux;
    // Velocity mass matrix and local inverses of the energy mass matrices. These
    // are constant in time, due to the pointwise mass conservation property.
@@ -190,6 +187,8 @@ protected:
 
    void UpdateQuadratureData(const Vector &S) const;
    void AssembleForceMatrix() const;
+   void ComputeConductionPostprocess(const Vector &S, Vector &de_cond,
+                                     Vector *cond_rhs = nullptr) const;
 
 public:
    LagrangianHydroOperator(const int size,
@@ -260,6 +259,7 @@ public:
                           ParGridFunction &work_tau, ParGridFunction &work_total) const;
 
    void ComputeConductionDiagnostics(const Vector &S, double &h_con, double &h_con_rms, ParGridFunction *work_cond = nullptr) const;
+   void ComputeConductionDiagnosticsPA(const Vector &S, double &h_con, double &h_con_rms, ParGridFunction *work_cond = nullptr) const;
 
    double IntegrateL2Field(const Vector &z) const;
    double IntegrateL2FieldSquared(const Vector &z) const;
