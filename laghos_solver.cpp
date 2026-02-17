@@ -709,8 +709,10 @@ void LagrangianHydroOperator::UpdateConductionOperator(const Vector &S) const
       std::cout << "Conduction enabled: Pr = " << Pr
                 << ", mu = " << mu
                 << ", gamma = " << gamma
-                << ", kappa = " << kappa_e << std::endl;
+                << ", kappa (R=1) = " << kappa
+                << ", kappa_e = " << kappa_e << std::endl;
    }
+   
 
    *u_cond_gf = kappa_e;
    u_cond_gf->ExchangeFaceNbrData();

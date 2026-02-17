@@ -62,6 +62,8 @@
 // mpirun -np 10 ./laghos -p 0 -dim 3 -rs 1 -rp 2 -tf 0.08 -pa -visit -iv -diag output.txt -mach 0.28 -u0 1.0 -s 7 -fv -Re 100 -cfl 0.2
 // mpirun -np 8 ./laghos -p 0 -dim 3 -rs 1 -rp 2 -tf 0.3 -pa -visit -iv -diag output.txt -mach 0.28 -u0 1.0 -s 7 -fv -Re 200 -cfl 0.5 --interp-cycle 1
 // mpirun -np 8 ./laghos -p 8 -dim 3 -rs 1 -rp 2 -ok 2 -ot 1 -s 2 -tf 0.1 -fv -Re 66.6732 -cond -pr 0.71 -ms 1000 -visit -dt 1e-3
+// mpirun -np 8 ./laghos -p 8 -dim 3 -rs 1 -rp 2 -ok 2 -ot 1 -s 2 -tf 0.1 -fv -Re 66.6732 -cond -pr 0.71 -ms 1000 -visit -dt 1e-4
+// mpirun -np 8 ./laghos -p 8 -dim 3 -rs 1 -rp 2 -ok 2 -ot 1 -s 2 -tf 0.2 -fv -Re 400 -cond -pr 0.71 -visit -dt 1e-4
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -1672,7 +1674,10 @@ int main(int argc, char *argv[])
       const double L = 1.0 / (2.0 * M_PI);
       viscosity_const = rho_ref * mach_u0 * L / reynolds;
       const double gamma_ref = gamma_func(x0);
+      // Assuming R constant = 1
+      const double cp_ref = gamma_ref/(gamma_ref-1);
       kappa_e = (prandtl_number > 0.0) ? (viscosity_const * gamma_ref) / prandtl_number : 0.0;
+      double kappa = (prandtl_number > 0.0) ? (viscosity_const * cp_ref) / prandtl_number : 0.0;
       if (Mpi::Root())
       {
          cout << "Fixed viscosity enabled: Re = " << reynolds
@@ -1680,7 +1685,8 @@ int main(int argc, char *argv[])
          if (use_conduction)
          {
             cout << "Heat conduction enabled: Pr = " << prandtl_number
-                 << ", kappa = " << kappa_e
+                 << ", kappa = " << kappa
+                 << ", kappa_e = " << kappa_e
                  << endl;
          }
       }
@@ -2670,7 +2676,7 @@ double gamma_func(const Vector &x)
 {
    switch (problem)
    {
-      case 0: return 5.0 / 3.0;
+      case 0: return 1.4;
       case 1: return 1.4;
       case 2: return 1.4;
       case 3:
@@ -2680,7 +2686,7 @@ double gamma_func(const Vector &x)
       case 5: return 1.4;
       case 6: return 1.4;
       case 7: return 5.0 / 3.0;
-      case 8: return 5.0 / 3.0;
+      case 8: return 1.4;
       default: MFEM_ABORT("Bad number given for problem id!"); return 0.0;
    }
 }
