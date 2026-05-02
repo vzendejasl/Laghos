@@ -108,6 +108,7 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
                                                  const bool cond_bdr_,
                                                  const double cond_flux_,
                                                  const bool freeze_mom,
+                                                 const bool enable_split_diag,
                                                  const bool p_assembly,
                                                  const double cgt,
                                                  const int cgiter,
@@ -136,6 +137,7 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    cond_bdr(cond_bdr_),
    cond_flux(cond_flux_),
    freeze_momentum(freeze_mom),
+   enable_split_diagnostics(enable_split_diag),
    viscosity_const(visc_const),
    prandtl_number(prandtl),
    p_assembly(p_assembly),
@@ -208,41 +210,38 @@ if (Mpi::Root()) {
       qupdate = new QUpdate(dim, NE, Q1D, visc, vort, visc_const, cfl,
                             &timer, gamma_gf, ir, H1, L2);
       ForcePA = new ForcePAOperator(qdata, H1, L2, ir);
-      ForcePA_pressure = new ForcePAOperator(qdata, H1, L2, ir, &qdata.pressureJinvT);
-      ForcePA_viscous  = new ForcePAOperator(qdata, H1, L2, ir, &qdata.viscousJinvT);
+      if (enable_split_diagnostics)
+      {
+         ForcePA_pressure = new ForcePAOperator(qdata, H1, L2, ir,
+                                                &qdata.pressureJinvT);
+         ForcePA_viscous  = new ForcePAOperator(qdata, H1, L2, ir,
+                                                &qdata.viscousJinvT);
 
-    #if 1  // set to 0 to disable
-    if (Mpi::Root()) { std::cout << "[sanity] Checking ForcePA selector consistency...\n"; }
-    
-    {
-       // Build a reference operator that explicitly uses total stress
-       ForcePAOperator ForcePA_explicit(qdata, H1, L2, ir, &qdata.stressJinvT);
-    
-       // Make a tiny test velocity (H1-sized). Use unit or random; unit is fine.
-       Vector vtest(H1Vsize), y_def(L2Vsize), y_ref(L2Vsize);
-       vtest = 0.0;
-       // put a few non-zeros to exercise kernels deterministically
-       const int stride = std::max(1, H1Vsize / 7);
-       for (int i = 0; i < H1Vsize; i += stride) { vtest[i] = 1.0; }
-    
-       // Apply both operators: y = (ForcePA)^T v
-       y_def  = 0.0; y_ref = 0.0;
-       ForcePA->MultTranspose(vtest, y_def);
-       ForcePA_explicit.MultTranspose(vtest, y_ref);
-    
-       // Compare
-       Vector diff(y_def); diff.Add(-1.0, y_ref);
-       const double rel = (y_ref.Norml2() > 0.0) ? diff.Norml2() / y_ref.Norml2()
-                                                 : diff.Norml2();
-    
-       if (Mpi::Root())
-       {
-          std::cout.setf(std::ios::scientific); std::cout.precision(6);
-          std::cout << "[sanity] ||(F_def^T - F_exp^T) v|| / ||F_exp^T v|| = "
-                    << rel << std::endl;
-       }
-    }
-    #endif
+         if (Mpi::Root()) { std::cout << "[sanity] Checking ForcePA selector consistency...\n"; }
+
+         {
+            ForcePAOperator ForcePA_explicit(qdata, H1, L2, ir, &qdata.stressJinvT);
+            Vector vtest(H1Vsize), y_def(L2Vsize), y_ref(L2Vsize);
+            vtest = 0.0;
+            const int stride = std::max(1, H1Vsize / 7);
+            for (int i = 0; i < H1Vsize; i += stride) { vtest[i] = 1.0; }
+            y_def  = 0.0;
+            y_ref = 0.0;
+            ForcePA->MultTranspose(vtest, y_def);
+            ForcePA_explicit.MultTranspose(vtest, y_ref);
+            Vector diff(y_def);
+            diff.Add(-1.0, y_ref);
+            const double rel = (y_ref.Norml2() > 0.0) ? diff.Norml2() / y_ref.Norml2()
+                                                      : diff.Norml2();
+            if (Mpi::Root())
+            {
+               std::cout.setf(std::ios::scientific);
+               std::cout.precision(6);
+               std::cout << "[sanity] ||(F_def^T - F_exp^T) v|| / ||F_exp^T v|| = "
+                         << rel << std::endl;
+            }
+         }
+      }
 
 
 
@@ -584,57 +583,52 @@ void LagrangianHydroOperator::SolveEnergy(const Vector &S, const Vector &v,
       // location of the base vector 'dS_dt'.
       de.GetMemory().SyncAlias(dS_dt.GetMemory(), de.Size());
 
-      // --- per-source RHS already available? if not, compute it now
-      // (if you did the RHS split earlier in this function, reuse those vectors)
-      e_rhs_p = 0.0;
-      e_rhs_tau = 0.0;
-      ForcePA_pressure->MultTranspose(v, e_rhs_p);
-      ForcePA_viscous->MultTranspose(v, e_rhs_tau);
-      if (e_source) { /* source belongs to 'total' only; keep split pure */ }
-      
-      // Sanity A (RHS): total ≈ pressure + viscous
-      Vector rhs_sum(e_rhs_p); rhs_sum.Add(1.0, e_rhs_tau);
-      Vector rhs_res(e_rhs);   rhs_res.Add(-1.0, rhs_sum);
-      const double rhs_rel =
-         (rhs_sum.Norml2() > 0.0) ? rhs_res.Norml2()/rhs_sum.Norml2()
-                                  : rhs_res.Norml2();
-      
-      // Solve per-source energy increments: M_e * de_* = e_rhs_*
-      Vector de_p(L2Vsize), de_tau(L2Vsize);
-      CG_EMass.Mult(e_rhs_p,  de_p);
-      CG_EMass.Mult(e_rhs_tau, de_tau);
-      
-      // Sanity B (field level): de_total ≈ de_p + de_tau
-      Vector de_sum(de_p); de_sum.Add(1.0, de_tau);
-      Vector de_res(de_sum); de_res.Add(-1.0, de);
-      const double de_rel =
-         (de.Norml2() > 0.0) ? de_res.Norml2()/de.Norml2()
-                             : de_res.Norml2();
-      
-      // Integrate to "power" diagnostics
-      const double Pp   = IntegrateL2Field(de_p);
-      const double Ptau = IntegrateL2Field(de_tau);
-      const double Pcond = solve_conduction_power;
-      const double total_rhs_power = IntegrateL2Field(de);
-      solve_pressure_power = Pp;
-      solve_viscous_power = Ptau;
-      solve_total_power = total_rhs_power;
-      solve_power_valid = true;
-      
-      /*
-      // Print (use scientific to avoid hex-float surprises)
-      if (Mpi::Root())
+      if (enable_split_diagnostics)
       {
-         std::cout.setf(std::ios::scientific, std::ios::floatfield);
-       std::cout.precision(6);
-          std::cout << "[power] total = " << total_rhs_power
-                    << " pressure = " << Pp
-                    << ", viscous = "      << Ptau
-                    << ", sum = "          << (Pp + Ptau) << '\n'
-                    << "[sanity] RHS split rel = " << rhs_rel
-                    << ", de split rel = "        << de_rel
-                    << std::endl;
-      }*/
+         // Split-force diagnostics are optional and must not affect the base solve.
+         e_rhs_p = 0.0;
+         e_rhs_tau = 0.0;
+         ForcePA_pressure->MultTranspose(v, e_rhs_p);
+         ForcePA_viscous->MultTranspose(v, e_rhs_tau);
+         if (e_source) { /* source belongs to 'total' only; keep split pure */ }
+
+         Vector rhs_sum(e_rhs_p);
+         rhs_sum.Add(1.0, e_rhs_tau);
+         Vector rhs_res(e_rhs);
+         rhs_res.Add(-1.0, rhs_sum);
+         const double rhs_rel =
+            (rhs_sum.Norml2() > 0.0) ? rhs_res.Norml2()/rhs_sum.Norml2()
+                                     : rhs_res.Norml2();
+
+         Vector de_p(L2Vsize), de_tau(L2Vsize);
+         CG_EMass.Mult(e_rhs_p,  de_p);
+         CG_EMass.Mult(e_rhs_tau, de_tau);
+
+         Vector de_sum(de_p);
+         de_sum.Add(1.0, de_tau);
+         Vector de_res(de_sum);
+         de_res.Add(-1.0, de);
+         const double de_rel =
+            (de.Norml2() > 0.0) ? de_res.Norml2()/de.Norml2()
+                                : de_res.Norml2();
+
+         const double Pp = IntegrateL2Field(de_p);
+         const double Ptau = IntegrateL2Field(de_tau);
+         const double total_rhs_power = IntegrateL2Field(de);
+         solve_pressure_power = Pp;
+         solve_viscous_power = Ptau;
+         solve_total_power = total_rhs_power;
+         solve_power_valid = true;
+
+         (void)rhs_rel;
+         (void)de_rel;
+      }
+      else
+      {
+         solve_pressure_power = 0.0;
+         solve_viscous_power = 0.0;
+         solve_total_power = 0.0;
+      }
 
 
 
@@ -1056,6 +1050,7 @@ double LagrangianHydroOperator::IntegrateL2FieldSquared(const Vector &z) const
 
 double LagrangianHydroOperator::ComputeTotalWork(const Vector &v, double dt) const
 {
+   if (!p_assembly || !ForcePA) { return 0.0; }
    Vector e_rhs_total(L2Vsize), de_total(L2Vsize);
    
    // Compute total energy RHS and solve
@@ -1069,6 +1064,7 @@ double LagrangianHydroOperator::ComputeTotalWork(const Vector &v, double dt) con
 
 double LagrangianHydroOperator::ComputePressureWork(const Vector &v, double dt) const
 {
+   if (!enable_split_diagnostics || !ForcePA_pressure) { return 0.0; }
    Vector e_rhs_p(L2Vsize), de_p(L2Vsize);
    
    // Compute pressure energy RHS and solve
@@ -1083,6 +1079,7 @@ double LagrangianHydroOperator::ComputePressureWork(const Vector &v, double dt) 
 
 double LagrangianHydroOperator::ComputeViscousWork(const Vector &v, double dt) const
 {
+   if (!enable_split_diagnostics || !ForcePA_viscous) { return 0.0; }
    Vector e_rhs_tau(L2Vsize), de_tau(L2Vsize);
 
    // Compute viscous energy RHS and solve
@@ -1112,7 +1109,8 @@ void LagrangianHydroOperator::ComputeWorkFields(const Vector &v,
                                                 ParGridFunction &work_tau,
                                                 ParGridFunction &work_total) const
 {
-   if (!p_assembly) { return; }
+   if (!p_assembly || !enable_split_diagnostics ||
+       !ForcePA_pressure || !ForcePA_viscous) { return; }
 
    // Compute Pressure energy RHS and solve for the field
    e_rhs_p = 0.0;
@@ -1253,13 +1251,13 @@ void LagrangianHydroOperator::ComputeAcceleration(Vector &accel,
    SolveComponent(ForcePA, accel);
 
    // 2. Compute Pressure Acceleration (if requested)
-   if (accel_p)
+   if (accel_p && enable_split_diagnostics && ForcePA_pressure)
    {
       SolveComponent(ForcePA_pressure, *accel_p);
    }
 
    // 3. Compute Viscous Acceleration (if requested)
-   if (accel_tau)
+   if (accel_tau && enable_split_diagnostics && ForcePA_viscous)
    {
       SolveComponent(ForcePA_viscous, *accel_tau);
    }
@@ -1470,7 +1468,7 @@ void LagrangianHydroOperator::UpdateQuadratureData(const Vector &S) const
             // Assuming piecewise constant gamma that moves with the mesh.
             gamma_b[idx] = gamma_gf(z_id);
             rho_b[idx] = qdata.rho0DetJ0w(z_id*nqp + q) / detJ / ip.weight;
-            e_b[idx] = e_vals(q);
+            e_b[idx] = fmax(0.0, e_vals(q));
          }
          ++z_id;
       }
@@ -1698,7 +1696,7 @@ void QUpdateBody(const int NE, const int e,
    min_detJ = fmin(min_detJ, detJ);
    kernels::CalcInverse<DIM>(J, Jinv);
    const double R = inv_weight * d_rho0DetJ0w[eq] / detJ;
-   const double E = d_e_quads[eq];
+   const double E = fmax(0.0, d_e_quads[eq]);
    const double P = (gamma - 1.0) * R * E;
    const double S = sqrt(gamma * (gamma - 1.0) * E);
 
@@ -1777,13 +1775,14 @@ void QUpdateBody(const int NE, const int e,
       // kernels::Add(DIM, DIM, visc_coeff, stress, sgrad_v, stress);
 
       for (int k = 0; k < DIM2; k++){
-         if (use_viscosity){
-            stress[k] = pressure_stress[k] + viscous_stress[k];
-         } else{
-            stress[k] = pressure_stress[k];
-            viscous_stress[k] = 0.0;
-         }
-         
+         stress[k] = pressure_stress[k] + viscous_stress[k];
+      }
+   }
+   else
+   {
+      // No viscosity: stress is just pressure.
+      for (int k = 0; k < DIM2; k++){
+         stress[k] = pressure_stress[k];
       }
    }
    // Time step estimate at the point. Here the more relevant length
@@ -2296,7 +2295,24 @@ void LagrangianHydroOperator::ComputeL2Diagnostics(
    }
    else
    {
-      MFEM_ABORT("L2 diagnostics not implemented for 1D.");
+      volume = 0.0;
+      rho_avg = 0.0;
+      temp_avg = 0.0;
+      rho_L2 = 0.0;
+      temp_L2 = 0.0;
+      divu_L2 = 0.0;
+      cs_L2 = 0.0;
+      rho_mw_L2 = 0.0;
+      temp_mw_L2 = 0.0;
+      divu_mw_L2 = 0.0;
+      cs_mw_L2 = 0.0;
+      mach_avg = 0.0;
+      mach_rms = 0.0;
+      mach_max = 0.0;
+      mach_avg_mw = 0.0;
+      mach_rms_mw = 0.0;
+      mach_min = 0.0;
+      return;
    }
 
    // Bring back to host

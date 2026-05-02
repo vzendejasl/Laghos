@@ -119,6 +119,7 @@ protected:
    const int dim, NE, l2dofs_cnt, h1dofs_cnt, source_type;
    const double cfl;
    const bool use_viscosity, use_vorticity, p_assembly;
+   const bool enable_split_diagnostics;
    bool use_conduction;
    const bool cond_bdr;
    const double cond_flux;
@@ -205,6 +206,7 @@ public:
                            const bool cond, const double prandtl,
                            const bool cond_bdr, const double cond_flux,
                            const bool freeze_momentum,
+                           const bool enable_split_diagnostics,
                            const bool pa,
                            const double cgt, const int cgiter, double ftz_tol,
                            const int order_q);

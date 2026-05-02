@@ -42,6 +42,9 @@
 //    p = 5  --> 2D Riemann problem, config. 12 of doi.org/10.1002/num.10025
 //    p = 6  --> 2D Riemann problem, config.  6 of doi.org/10.1002/num.10025
 //    p = 7  --> 2D Rayleigh-Taylor instability problem.
+//    p = 8  --> Conduction hot-spot problem.
+//    p = 9  --> 2D Taylor-Green vortex, paper 6.2 manufactured case.
+//    p = 10 --> Custom low-Mach Taylor-Green experiment.
 //
 // Sample runs: see README.md, section 'Verification of Results'.
 //
@@ -59,8 +62,8 @@
 // -m data/cube_522_hex.mesh -pt 521 for 10 / 80 / 640 / 5120 ... tasks.
 // -m data/cube_12_hex.mesh  -pt 322 for 12 / 96 / 768 / 6144 ... tasks.
 // Example runs:
-// mpirun -np 10 ./laghos -p 0 -dim 3 -rs 1 -rp 2 -tf 0.08 -pa -visit -iv -diag output.txt -mach 0.28 -u0 1.0 -s 7 -fv -Re 100 -cfl 0.2
-// mpirun -np 8 ./laghos -p 0 -dim 3 -rs 1 -rp 2 -tf 0.3 -pa -visit -iv -diag output.txt -mach 0.28 -u0 1.0 -s 7 -fv -Re 200 -cfl 0.5 --interp-cycle 1
+// mpirun -np 10 ./laghos -p 10 -dim 3 -rs 1 -rp 2 -tf 0.08 -pa -visit -iv -diag output.txt -mach 0.28 -u0 1.0 -s 7 -fv -Re 100 -cfl 0.2
+// mpirun -np 8 ./laghos -p 10 -dim 3 -rs 1 -rp 2 -tf 0.3 -pa -visit -iv -diag output.txt -mach 0.28 -u0 1.0 -s 7 -fv -Re 200 -cfl 0.5 --interp-cycle 1
 // mpirun -np 8 ./laghos -p 8 -dim 3 -rs 1 -rp 2 -ok 2 -ot 1 -s 2 -tf 0.1 -fv -Re 66.6732 -cond -pr 0.71 -ms 1000 -visit -dt 1e-3
 // mpirun -np 8 ./laghos -p 8 -dim 3 -rs 1 -rp 2 -ok 2 -ot 1 -s 2 -tf 0.1 -fv -Re 66.6732 -cond -pr 0.71 -ms 1000 -visit -dt 1e-4
 // mpirun -np 8 ./laghos -p 8 -dim 3 -rs 1 -rp 2 -ok 2 -ot 1 -s 2 -tf 0.2 -fv -Re 400 -cond -pr 0.71 -visit -dt 1e-4
@@ -1043,11 +1046,11 @@ int main(int argc, char *argv[])
    args.AddOption(&basename, "-k", "--outputfilename",
                   "Name of the visit dump files");
    args.AddOption(&p0_user, "-p0", "--pressure0",
-                  "Background pressure for problem 0 (used if -mach not set).");
+                  "Background pressure for problem 10 (used if -mach not set).");
    args.AddOption(&mach_number, "-mach", "--mach-number",
-                  "Mach number for problem 0 (overrides -p0).");
+                  "Mach number for problem 10 (overrides -p0).");
    args.AddOption(&mach_u0, "-u0", "--mach-uref",
-                  "Reference velocity for Mach number in problem 0.");
+                  "Reference velocity for Mach number in problem 10.");
    args.AddOption(&diag_file, "-diag", "--diag-file",
                   "Write per-step diagnostics to a text file (root rank).");
    args.AddOption(&partition_type, "-pt", "--partition",
@@ -1566,7 +1569,7 @@ int main(int argc, char *argv[])
    // is to get a high-order representation of the initial condition. Note that
    // this density is a temporary function and it will not be updated during the
    // time evolution.
-   if (problem == 0)
+   if (problem == 10)
    {
       Vector x0(dim); x0 = 0.0;
       const double rho_ref = rho0(x0);
@@ -1673,6 +1676,16 @@ int main(int argc, char *argv[])
       case 6: visc = true; break;
       case 7: source = 2; visc = true; vorticity = true;  break;
       case 8: visc = true; break;
+      case 9:
+         MFEM_VERIFY(pmesh->Dimension() == 2,
+                     "Problem 9 is only defined in 2D.");
+         source = 1;
+         visc = false;
+         break;
+      case 10:
+         if (pmesh->Dimension() == 2) { source = 1; }
+         visc = false;
+         break;
       default: MFEM_ABORT("Wrong problem specification!");
    }
    if (impose_visc) { visc = true; }
@@ -1715,6 +1728,8 @@ int main(int argc, char *argv[])
    }
 
    const bool freeze_momentum = (problem == 8);
+   const bool enable_split_diagnostics = visit ||
+                                         (diag_file && diag_file[0] != '\0');
    auto hydro = std::make_unique<hydrodynamics::LagrangianHydroOperator>(
       S.Size(),
       H1FESpace, L2FESpace, ess_tdofs,
@@ -1723,6 +1738,7 @@ int main(int argc, char *argv[])
       visc, vorticity, viscosity_const,
       use_conduction, prandtl_number, cond_bdr, cond_flux,
       freeze_momentum,
+      enable_split_diagnostics,
       p_assembly,
       cg_tol, cg_max_iter, ftz_tol,
       order_q);
@@ -1991,7 +2007,8 @@ int main(int argc, char *argv[])
    std::ofstream csv_ofs;
    std::ofstream csv_pa_ofs;
    std::ofstream csv_mw_ofs;
-   if (Mpi::Root())
+   const bool thermo_csv_output = diag_output;
+   if (thermo_csv_output && Mpi::Root())
    {
       csv_ofs.open("laghos_thermo.csv");
       csv_ofs << "                    Time,"
@@ -2055,6 +2072,7 @@ int main(int argc, char *argv[])
    }
 
    // Initial L2 diagnostics for laghos_thermo.csv (cycle 0)
+   if (thermo_csv_output)
    {
       double vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms;
       double r_rms_m, t_rms_m, d_rms_m, c_rms_m;
@@ -2232,10 +2250,12 @@ int main(int argc, char *argv[])
          }
          internal_energy = hydro->InternalEnergy(e_gf);
          kinetic_energy = hydro->KineticEnergy(v_gf);
-         // Compute work contributions over this timestep
-         total_work = hydro->ComputeTotalWork(v_gf, dt);
-         pressure_work = hydro->ComputePressureWork(v_gf, dt);
-         viscous_work = hydro->ComputeViscousWork(v_gf, dt);
+         if (diag_output)
+         {
+            total_work = hydro->ComputeTotalWork(v_gf, dt);
+            pressure_work = hydro->ComputePressureWork(v_gf, dt);
+            viscous_work = hydro->ComputeViscousWork(v_gf, dt);
+         }
          if (use_conduction && pmesh->GetNBE() > 0)
          {
             Diagnostics::ProjectL2toH1(e_gf, e_h1);
@@ -2299,7 +2319,7 @@ int main(int argc, char *argv[])
          }
       }
 
-      if (log_step)
+      if (thermo_csv_output && log_step)
       {
          double vol, r_avg, t_avg, r_rms, t_rms, d_rms, c_rms;
          double r_rms_m, t_rms_m, d_rms_m, c_rms_m;
@@ -2639,6 +2659,7 @@ int main(int argc, char *argv[])
                visc, vorticity, viscosity_const,
                use_conduction, prandtl_number, cond_bdr, cond_flux,
                freeze_momentum,
+               enable_split_diagnostics,
                p_assembly,
                cg_tol, cg_max_iter, ftz_tol,
                order_q);
@@ -2687,7 +2708,7 @@ int main(int argc, char *argv[])
 
    // Print the error.
    // For problems 0 and 4 the exact velocity is constant in time.
-   if (problem == 0 || problem == 4)
+   if (problem == 0 || problem == 4 || problem == 9 || problem == 10)
    {
       const double error_max = v_gf.ComputeMaxError(v_coeff),
                    error_l1  = v_gf.ComputeL1Error(v_coeff),
@@ -2769,6 +2790,8 @@ double rho0(const Vector &x)
       }
       case 7: return x(1) >= 0.0 ? 2.0 : 1.0;
       case 8: return 1.0;
+      case 9: return 1.0;
+      case 10: return 1.0;
       default: MFEM_ABORT("Bad number given for problem id!"); return 0.0;
    }
 }
@@ -2777,7 +2800,7 @@ double gamma_func(const Vector &x)
 {
    switch (problem)
    {
-      case 0: return 1.4;
+      case 0: return 5.0 / 3.0;
       case 1: return 1.4;
       case 2: return 1.4;
       case 3:
@@ -2788,6 +2811,8 @@ double gamma_func(const Vector &x)
       case 6: return 1.4;
       case 7: return 5.0 / 3.0;
       case 8: return 1.4;
+      case 9: return 5.0 / 3.0;
+      case 10: return 1.4;
       default: MFEM_ABORT("Bad number given for problem id!"); return 0.0;
    }
 }
@@ -2801,6 +2826,16 @@ void v0(const Vector &x, Vector &v)
    switch (problem)
    {
       case 0:
+         v(0) =  sin(M_PI*x(0)) * cos(M_PI*x(1));
+         v(1) = -cos(M_PI*x(0)) * sin(M_PI*x(1));
+         if (x.Size() == 3)
+         {
+            v(0) *= cos(M_PI*x(2));
+            v(1) *= cos(M_PI*x(2));
+            v(2) = 0.0;
+         }
+         break;
+      case 10:
          v(0) =  sin(2.0*M_PI*x(0)) * cos(2.0*M_PI*x(1));
          v(1) = -cos(2.0*M_PI*x(0)) * sin(2.0*M_PI*x(1));
          if (x.Size() == 3)
@@ -2857,6 +2892,10 @@ void v0(const Vector &x, Vector &v)
          break;
       }
       case 8: v = 0.0; break;
+      case 9:
+         v(0) =  sin(M_PI*x(0)) * cos(M_PI*x(1));
+         v(1) = -cos(M_PI*x(0)) * sin(M_PI*x(1));
+         break;
       default: MFEM_ABORT("Bad number given for problem id!");
    }
 }
@@ -2867,26 +2906,17 @@ double e0(const Vector &x)
    {
       case 0:
       {
-         const double rho = rho0(x);
-         const double gamma = gamma_func(x);
-         const double denom = (gamma - 1.0) * rho;
-         const double L = 1.0 / (2.0 * M_PI);
-         const double k = 2.0 / L;
-         const double p0 = p0_background;
-         const double rho0u0u0 = rho * mach_u0 * mach_u0;
          double val;
          if (x.Size() == 2)
          {
-            val = p0 + (rho0u0u0 / 4.0) *
-                        (cos(k*x(0)) + cos(k*x(1)));
+            val = 1.0 + (cos(2*M_PI*x(0)) + cos(2*M_PI*x(1))) / 4.0;
          }
          else
          {
-            val = p0 + (rho0u0u0 / 16.0) *
-                        (cos(k*x(0)) + cos(k*x(1))) *
-                        (cos(k*x(2)) + 2.0);
+            val = 100.0 + ((cos(2*M_PI*x(2)) + 2) *
+                           (cos(2*M_PI*x(0)) + cos(2*M_PI*x(1))) - 2) / 16.0;
          }
-         return val / denom;
+         return 1.5 * val;
       }
       case 1: return 0.0; // This case in initialized in main().
       case 2: return (x(0) < 0.5) ? 1.0 / rho0(x) / (gamma_func(x) - 1.0)
@@ -2953,6 +2983,37 @@ double e0(const Vector &x)
          }
          double T = (r2 <= radius2) ? 2.0 : 0.0;
          return T;
+      }
+      case 9:
+      {
+         const double rho = rho0(x);
+         const double gamma = gamma_func(x);
+         const double p = 1.0 + 0.25 *
+                          (cos(2.0 * M_PI * x(0)) + cos(2.0 * M_PI * x(1)));
+         return p / ((gamma - 1.0) * rho);
+      }
+      case 10:
+      {
+         const double rho = rho0(x);
+         const double gamma = gamma_func(x);
+         const double denom = (gamma - 1.0) * rho;
+         const double L = 1.0 / (2.0 * M_PI);
+         const double k = 2.0 / L;
+         const double p0 = p0_background;
+         const double rho0u0u0 = rho * mach_u0 * mach_u0;
+         double val;
+         if (x.Size() == 2)
+         {
+            val = p0 + (rho0u0u0 / 4.0) *
+                        (cos(k*x(0)) + cos(k*x(1)));
+         }
+         else
+         {
+            val = p0 + (rho0u0u0 / 16.0) *
+                        (cos(k*x(0)) + cos(k*x(1))) *
+                        (cos(k*x(2)) + 2.0);
+         }
+         return val / denom;
       }
       default: MFEM_ABORT("Bad number given for problem id!"); return 0.0;
    }
