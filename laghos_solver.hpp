@@ -60,6 +60,7 @@ class QUpdate
 private:
    const int dim, vdim, NQ, NE, Q1D;
    const bool use_viscosity, use_vorticity;
+   const bool use_hypervisc;
    const double viscosity_const;
    const double cfl;
    TimingData *timer;
@@ -70,8 +71,11 @@ private:
    const ParGridFunction &gamma_gf;
 public:
    Vector q_dt_est, q_e, e_vec, q_dx, q_dv, q_v;
+   // Precomputed hyperviscosity coefficient at quadrature points.
+   const Vector *hv_qdata;
    QUpdate(const int d, const int ne, const int q1d,
            const bool visc, const bool vort,
+           const bool hypervisc,
            const double visc_const,
            const double cfl, TimingData *t,
            const ParGridFunction &gamma_gf,
@@ -80,6 +84,7 @@ public:
       dim(d), vdim(h1.GetVDim()),
       NQ(ir.GetNPoints()), NE(ne), Q1D(q1d),
       use_viscosity(visc), use_vorticity(vort),
+      use_hypervisc(hypervisc),
       viscosity_const(visc_const), cfl(cfl),
       timer(t), ir(ir), H1(h1), L2(l2),
       H1R(H1.GetElementRestriction(ElementDofOrdering::LEXICOGRAPHIC)),
@@ -91,7 +96,8 @@ public:
       q_v(NQ*NE*vdim),
       q1(H1.GetQuadratureInterpolator(ir)),
       q2(L2.GetQuadratureInterpolator(ir)),
-      gamma_gf(gamma_gf) { }
+      gamma_gf(gamma_gf),
+      hv_qdata(nullptr) { }
 
    void UpdateQuadratureData(const Vector &S, QuadratureData &qdata);
 };
@@ -126,11 +132,29 @@ protected:
    const bool freeze_momentum;
    const double viscosity_const;
    double prandtl_number;
+   const bool use_hypervisc;
+   const double hv_coeff;
+   const int hv_z;
+   const int hv_smooth_steps;
+   const double hv_smooth_omega;
    const double cg_rel_tol;
    const int cg_max_iter;
    const double ftz_tol;
    Coefficient &rho0_coeff;
    const ParGridFunction &gamma_gf;
+
+   // Hyperviscosity scalar FE machinery.
+   H1_FECollection *hv_fec;
+   ParFiniteElementSpace *hv_fes;
+   ParBilinearForm *hv_mass_form;
+   ParBilinearForm *hv_stiff_form;
+   CGSolver *hv_M_inv;
+   const Operator *hv_er;
+   OperatorHandle hv_M_handle, hv_K_handle;
+   mutable Vector hv_work, hv_tmp, hv_rhs, hv_hpow, hv_Kdiag, hv_evec;
+   mutable Vector hv_qdata_vec;
+   mutable ParGridFunction hv_sensor_gf, hv_mu_gf;
+   const QuadratureInterpolator *hv_qi;
 
    // DG Conduction operator post-processing (standalone function call)
    mutable ParLinearForm *e_bdr_flux;
@@ -188,6 +212,7 @@ protected:
 
    void UpdateQuadratureData(const Vector &S) const;
    void AssembleForceMatrix() const;
+   void ComputeHyperViscosity(const Vector &S) const;
    void ComputeConductionPostprocess(const Vector &S, Vector &de_cond,
                                      Vector *cond_rhs = nullptr) const;
 
@@ -207,6 +232,9 @@ public:
                            const bool cond_bdr, const double cond_flux,
                            const bool freeze_momentum,
                            const bool enable_split_diagnostics,
+                           const bool hypervisc,
+                           const double hv_c, const int hv_z_,
+                           const int hv_ss, const double hv_so,
                            const bool pa,
                            const double cgt, const int cgiter, double ftz_tol,
                            const int order_q);
@@ -259,6 +287,12 @@ public:
 
    void ComputeWorkFields(const Vector &v, ParGridFunction &work_p,
                           ParGridFunction &work_tau, ParGridFunction &work_total) const;
+
+   ParGridFunction *GetHyperviscosityField() const
+   { return use_hypervisc ? &hv_mu_gf : nullptr; }
+
+   ParGridFunction *GetHyperviscSensorField() const
+   { return use_hypervisc ? &hv_sensor_gf : nullptr; }
 
    void ComputeConductionDiagnostics(const Vector &S, double &h_con, double &h_con_rms, ParGridFunction *work_cond = nullptr) const;
    void ComputeConductionDiagnosticsPA(const Vector &S, double &h_con, double &h_con_rms, ParGridFunction *work_cond = nullptr) const;

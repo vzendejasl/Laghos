@@ -947,6 +947,11 @@ int main(int argc, char *argv[])
    bool fixed_viscosity = false;
    double reynolds = -1.0;
    double viscosity_const = -1.0;
+   bool use_hypervisc = false;
+   double hv_coeff = 0.25;
+   int hv_z = 1;
+   int hv_smooth_steps = 5;
+   double hv_smooth_omega = 2.0 / 3.0;
    double kappa_e = 0.0;
    bool use_conduction = false;
    double prandtl_number = 0.71;
@@ -1021,6 +1026,17 @@ int main(int argc, char *argv[])
                   "Use constant physical viscosity (overrides artificial).");
    args.AddOption(&reynolds, "-Re", "--reynolds",
                   "Reynolds number for fixed viscosity (L=1/(2*pi)).");
+   args.AddOption(&use_hypervisc, "-hypervisc", "--hypervisc", "-no-hypervisc",
+                  "--no-hypervisc",
+                  "Enable explicit hyperviscosity (replaces standard AV).");
+   args.AddOption(&hv_coeff, "-hv-coeff", "--hv-coeff",
+                  "Hyperviscosity coefficient c_h.");
+   args.AddOption(&hv_z, "-hv-z", "--hv-z",
+                  "Number of discrete Laplacian applications (default 1).");
+   args.AddOption(&hv_smooth_steps, "-hv-ss", "--hv-smooth-steps",
+                  "Number of weighted-Jacobi smoothing steps.");
+   args.AddOption(&hv_smooth_omega, "-hv-so", "--hv-smooth-omega",
+                  "Weighted-Jacobi omega for smoothing.");
    args.AddOption(&use_conduction, "-cond", "--conduction", "-no-cond",
                   "--no-conduction",
                   "Enable or disable heat conduction.");
@@ -1730,6 +1746,7 @@ int main(int argc, char *argv[])
    const bool freeze_momentum = (problem == 8);
    const bool enable_split_diagnostics = visit ||
                                          (diag_file && diag_file[0] != '\0');
+   if (use_hypervisc) { visc = true; }
    auto hydro = std::make_unique<hydrodynamics::LagrangianHydroOperator>(
       S.Size(),
       H1FESpace, L2FESpace, ess_tdofs,
@@ -1739,6 +1756,7 @@ int main(int argc, char *argv[])
       use_conduction, prandtl_number, cond_bdr, cond_flux,
       freeze_momentum,
       enable_split_diagnostics,
+      use_hypervisc, hv_coeff, hv_z, hv_smooth_steps, hv_smooth_omega,
       p_assembly,
       cg_tol, cg_max_iter, ftz_tol,
       order_q);
@@ -1848,6 +1866,13 @@ int main(int argc, char *argv[])
       visit_dc.RegisterField("Sound Speed", &cs_gf);
       visit_dc.RegisterField("Mach", &mach_gf);
       visit_dc.RegisterField("Vorticity", &w_gf);
+      if (use_hypervisc)
+      {
+         visit_dc.RegisterField("Hyperviscosity",
+                                hydro->GetHyperviscosityField());
+         visit_dc.RegisterField("HyperviscSensor",
+                                hydro->GetHyperviscSensorField());
+      }
       visit_dc.SetCycle(0);
       visit_dc.SetTime(0.0);
       visit_dc.Save();
@@ -1870,6 +1895,13 @@ int main(int argc, char *argv[])
       visit_dc_debug.RegisterField("Acceleration", &accel_gf);
       visit_dc_debug.RegisterField("AccelPressure", &accel_p);
       visit_dc_debug.RegisterField("AccelViscous", &accel_tau);
+      if (use_hypervisc)
+      {
+         visit_dc_debug.RegisterField("Hyperviscosity",
+                                      hydro->GetHyperviscosityField());
+         visit_dc_debug.RegisterField("HyperviscSensor",
+                                      hydro->GetHyperviscSensorField());
+      }
       
       if (visc)
       {
@@ -2660,6 +2692,7 @@ int main(int argc, char *argv[])
                use_conduction, prandtl_number, cond_bdr, cond_flux,
                freeze_momentum,
                enable_split_diagnostics,
+               use_hypervisc, hv_coeff, hv_z, hv_smooth_steps, hv_smooth_omega,
                p_assembly,
                cg_tol, cg_max_iter, ftz_tol,
                order_q);
@@ -2754,6 +2787,14 @@ int main(int argc, char *argv[])
       cout << "Mach avg  = " << mach_avg << "\n";
       cout << "Mach RMS  = " << mach_rms << "\n";
       cout << "Mach max  = " << mach_max << "\n\n";
+   }
+
+   if (problem == 9 && Mpi::Root())
+   {
+      const double rho_l2_error =
+         std::sqrt(std::max(r_rms * r_rms - 2.0 * r_avg + 1.0, 0.0));
+      cout << std::scientific << std::setprecision(14)
+           << "rho L_2 error: " << rho_l2_error << endl;
    }
 
    // Free the used memory.

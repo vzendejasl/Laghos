@@ -30,6 +30,112 @@ namespace mfem
 namespace hydrodynamics
 {
 
+// Sensor coefficient for hyperviscosity: g = h^2 * ||S(v)||_F.
+class StrainFrobeniusCoefficient : public Coefficient
+{
+   const GridFunction *u_;
+   const Mesh *mesh_;
+public:
+   StrainFrobeniusCoefficient(const GridFunction *u, const Mesh *m)
+      : u_(u), mesh_(m) { }
+   double Eval(ElementTransformation &T, const IntegrationPoint &ip) override
+   {
+      T.SetIntPoint(&ip);
+      DenseMatrix grad;
+      u_->GetVectorGradient(T, grad);
+      const int d = grad.Width();
+      double s2 = 0.0;
+      for (int i = 0; i < d; i++)
+         for (int j = 0; j < d; j++)
+         {
+            const double sij = 0.5 * (grad(i, j) + grad(j, i));
+            s2 += sij * sij;
+         }
+      const double h = mesh_->GetElementSize(&T, 0);
+      return h * h * sqrt(fmax(s2, 0.0));
+   }
+};
+
+// Element size to the power p: h^p.
+class ElementSizePowerCoefficient : public Coefficient
+{
+   const Mesh *mesh_;
+   double power_;
+public:
+   ElementSizePowerCoefficient(const Mesh *m, double p)
+      : mesh_(m), power_(p) { }
+   double Eval(ElementTransformation &T, const IntegrationPoint &ip) override
+   {
+      double h = mesh_->GetElementSize(&T, 0);
+      return pow(h, power_);
+   }
+};
+
+// Boundary term S_bc x for the paper's primal-to-primal Laplacian:
+//   Delta_h = M^{-1} (S_bc - S).
+class BoundaryNormalDerivativeLFIntegrator : public LinearFormIntegrator
+{
+private:
+   GradientGridFunctionCoefficient grad_u;
+   mutable Vector shape, grad_val, nor;
+
+public:
+   explicit BoundaryNormalDerivativeLFIntegrator(const GridFunction *u)
+      : grad_u(u) { }
+
+   using LinearFormIntegrator::AssembleRHSElementVect;
+
+   void AssembleRHSElementVect(const FiniteElement &el,
+                               ElementTransformation &Tr,
+                               Vector &elvect) override
+   {
+      elvect.SetSize(el.GetDof());
+      elvect = 0.0;
+   }
+
+   void AssembleRHSElementVect(const FiniteElement &el,
+                               FaceElementTransformations &Tr,
+                               Vector &elvect) override
+   {
+      const int dof = el.GetDof();
+      const int dim = Tr.Elem1->GetSpaceDim();
+      const IntegrationRule *ir = IntRule;
+      if (ir == nullptr)
+      {
+         ir = &IntRules.Get(Tr.FaceGeom, 2 * el.GetOrder());
+      }
+
+      shape.SetSize(dof);
+      grad_val.SetSize(dim);
+      nor.SetSize(dim);
+      elvect.SetSize(dof);
+      elvect = 0.0;
+
+      for (int p = 0; p < ir->GetNPoints(); ++p)
+      {
+         const IntegrationPoint &ip = ir->IntPoint(p);
+         Tr.SetAllIntPoints(&ip);
+         const IntegrationPoint &eip = Tr.GetElement1IntPoint();
+
+         grad_u.Eval(grad_val, *Tr.Elem1, eip);
+
+         if (dim == 1)
+         {
+            nor = 0.0;
+            nor(0) = 2.0 * eip.x - 1.0;
+         }
+         else
+         {
+            CalcOrtho(Tr.Face->Jacobian(), nor);
+         }
+
+         const double dudn = grad_val * nor;
+         el.CalcShape(eip, shape);
+         add(elvect, ip.weight * dudn, shape, elvect);
+      }
+   }
+};
+
 void VisualizeField(socketstream &sock, const char *vishost, int visport,
                     ParGridFunction &gf, const char *title,
                     int x, int y, int w, int h, bool vec)
@@ -109,6 +215,11 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
                                                  const double cond_flux_,
                                                  const bool freeze_mom,
                                                  const bool enable_split_diag,
+                                                 const bool hypervisc,
+                                                 const double hv_c,
+                                                 const int hv_z_,
+                                                 const int hv_ss,
+                                                 const double hv_so,
                                                  const bool p_assembly,
                                                  const double cgt,
                                                  const int cgiter,
@@ -140,10 +251,19 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    enable_split_diagnostics(enable_split_diag),
    viscosity_const(visc_const),
    prandtl_number(prandtl),
+   use_hypervisc(hypervisc),
+   hv_coeff(hv_c),
+   hv_z(hv_z_),
+   hv_smooth_steps(hv_ss),
+   hv_smooth_omega(hv_so),
    p_assembly(p_assembly),
    cg_rel_tol(cgt), cg_max_iter(cgiter),ftz_tol(ftz),
    rho0_coeff(rho0_coeff),
    gamma_gf(gamma_gf),
+   hv_fec(nullptr), hv_fes(nullptr),
+   hv_mass_form(nullptr), hv_stiff_form(nullptr),
+   hv_M_inv(nullptr), hv_qi(nullptr),
+   hv_er(nullptr),
    Mv(&H1), Mv_spmat_copy(),
    Me(l2dofs_cnt, l2dofs_cnt, NE),
    Me_inv(l2dofs_cnt, l2dofs_cnt, NE),
@@ -207,8 +327,8 @@ if (Mpi::Root()) {
 
    if (p_assembly)
    {
-      qupdate = new QUpdate(dim, NE, Q1D, visc, vort, visc_const, cfl,
-                            &timer, gamma_gf, ir, H1, L2);
+      qupdate = new QUpdate(dim, NE, Q1D, visc, vort, hypervisc, visc_const,
+                            cfl, &timer, gamma_gf, ir, H1, L2);
       ForcePA = new ForcePAOperator(qdata, H1, L2, ir);
       if (enable_split_diagnostics)
       {
@@ -361,6 +481,79 @@ if (Mpi::Root()) {
       Force.Assemble(0);
       Force.Finalize(0);
    }
+
+   // Hyperviscosity scalar FE setup.
+   if (use_hypervisc)
+   {
+      const int h1_order = H1.GetOrder(0);
+      hv_fec = new H1_FECollection(h1_order, dim);
+      hv_fes = new ParFiniteElementSpace(pmesh, hv_fec);
+
+      hv_mass_form = new ParBilinearForm(hv_fes);
+      hv_stiff_form = new ParBilinearForm(hv_fes);
+      if (p_assembly)
+      {
+         hv_mass_form->SetAssemblyLevel(AssemblyLevel::PARTIAL);
+         hv_stiff_form->SetAssemblyLevel(AssemblyLevel::PARTIAL);
+      }
+      hv_mass_form->AddDomainIntegrator(new MassIntegrator());
+      hv_stiff_form->AddDomainIntegrator(new DiffusionIntegrator());
+      hv_mass_form->Assemble();
+      hv_stiff_form->Assemble();
+      if (!p_assembly)
+      {
+         hv_mass_form->Finalize();
+         hv_stiff_form->Finalize();
+      }
+
+      // Form system matrices at true-dof level.
+      Array<int> empty_tdofs;
+      hv_mass_form->FormSystemMatrix(empty_tdofs, hv_M_handle);
+      hv_stiff_form->FormSystemMatrix(empty_tdofs, hv_K_handle);
+
+      hv_M_inv = new CGSolver(pmesh->GetComm());
+      hv_M_inv->iterative_mode = false;
+      hv_M_inv->SetPrintLevel(0);
+      hv_M_inv->SetMaxIter(cg_max_iter);
+      hv_M_inv->SetRelTol(cg_rel_tol);
+      hv_M_inv->SetAbsTol(0.0);
+      hv_M_inv->SetOperator(*hv_M_handle.Ptr());
+
+      hv_er = hv_fes->GetElementRestriction(ElementDofOrdering::LEXICOGRAPHIC);
+      const int tv = hv_fes->GetTrueVSize();
+      hv_evec.SetSize(hv_er->Height());
+      hv_work.SetSize(tv);
+      hv_tmp.SetSize(tv);
+      hv_rhs.SetSize(tv);
+      hv_hpow.SetSize(tv);
+      hv_Kdiag.SetSize(tv);
+      hv_sensor_gf.SetSpace(hv_fes);
+      hv_mu_gf.SetSpace(hv_fes);
+
+      // Stiffness diagonal for Jacobi smoothing at the true-dof level.
+      hv_K_handle.Ptr()->AssembleDiagonal(hv_Kdiag);
+
+      // Element size h^{2z} at scalar DOFs.
+      ElementSizePowerCoefficient hpow_coeff(pmesh, 2.0 * hv_z);
+      ParGridFunction hpow_gf(hv_fes);
+      hpow_gf.ProjectCoefficient(hpow_coeff);
+      hpow_gf.GetTrueDofs(hv_hpow);
+
+      // Quadrature interpolator for sensor → quadrature points.
+      hv_qi = hv_fes->GetQuadratureInterpolator(ir);
+      hv_qdata_vec.SetSize(NE * ir.GetNPoints());
+      hv_qdata_vec = 0.0;
+
+      if (Mpi::Root())
+      {
+         std::cout << "Hyperviscosity enabled: c_h=" << hv_coeff
+                   << " z=" << hv_z
+                   << " smooth_steps=" << hv_smooth_steps
+                   << " omega=" << hv_smooth_omega
+                   << " scalar_dofs=" << hv_fes->GlobalTrueVSize()
+                   << std::endl;
+      }
+   }
 }
 
 LagrangianHydroOperator::~LagrangianHydroOperator()
@@ -375,7 +568,85 @@ LagrangianHydroOperator::~LagrangianHydroOperator()
       delete ForcePA_pressure;
       delete ForcePA_viscous;
    }
+   delete hv_M_inv;
+   delete hv_stiff_form;
+   delete hv_mass_form;
+   delete hv_fes;
+   delete hv_fec;
    delete e_bdr_flux;
+}
+
+void LagrangianHydroOperator::ComputeHyperViscosity(const Vector &S) const
+{
+   if (!use_hypervisc) { return; }
+
+   // Extract velocity from state vector.
+   Vector* sptr = const_cast<Vector*>(&S);
+   ParGridFunction v_gf;
+   v_gf.MakeRef(&H1, *sptr, H1.GetVSize());
+
+   // Step 1: Compute sensor g = h^2 * ||S(v)||_F at scalar DOFs.
+   StrainFrobeniusCoefficient g_coeff(&v_gf, pmesh);
+   hv_sensor_gf.ProjectCoefficient(g_coeff);
+
+   // Work on true-dof level for the Laplacian pipeline.
+   // Use FormLinearSystem/RecoverFEMSolution pattern for parallel correctness.
+   hv_sensor_gf.GetTrueDofs(hv_work);
+
+   // Step 2: Apply the paper's primal-to-primal discrete Laplacian
+   // Delta_h = M^{-1} (S_bc - S) z times.
+   for (int k = 0; k < hv_z; k++)
+   {
+      // Interior contribution: -S x.
+      hv_K_handle.Ptr()->Mult(hv_work, hv_rhs);
+      hv_rhs *= -1.0;
+
+      // Boundary contribution: +S_bc x.
+      hv_sensor_gf.SetFromTrueDofs(hv_work);
+      ParLinearForm b_form(hv_fes);
+      b_form.AddBdrFaceIntegrator(
+         new BoundaryNormalDerivativeLFIntegrator(&hv_sensor_gf));
+      b_form.Assemble();
+      b_form.ParallelAssemble(hv_tmp);
+      hv_rhs += hv_tmp;
+
+      hv_M_inv->Mult(hv_rhs, hv_work);
+   }
+
+   // Step 3: Absolute value.
+   for (int i = 0; i < hv_work.Size(); i++)
+   {
+      hv_work(i) = fabs(hv_work(i));
+   }
+
+   // Step 4: Weighted Jacobi smoothing on the true-dof operator.
+   for (int s = 0; s < hv_smooth_steps; s++)
+   {
+      hv_K_handle.Ptr()->Mult(hv_work, hv_rhs);
+      for (int i = 0; i < hv_work.Size(); i++)
+      {
+         const double di = hv_Kdiag(i);
+         if (di != 0.0)
+         {
+            hv_work(i) -= hv_smooth_omega * hv_rhs(i) / di;
+         }
+      }
+   }
+
+   // Step 5: Scale by c_h * h^{2z}.
+   for (int i = 0; i < hv_work.Size(); i++)
+   {
+      hv_work(i) = hv_coeff * hv_hpow(i) * hv_work(i);
+   }
+
+   // Step 6: Interpolate to quadrature points.
+   hv_mu_gf.SetFromTrueDofs(hv_work);
+   hv_er->Mult(hv_mu_gf, hv_evec);
+   hv_qi->SetOutputLayout(QVectorLayout::byNODES);
+   hv_qi->Values(hv_evec, hv_qdata_vec);
+
+   // Make available to QUpdate.
+   if (qupdate) { qupdate->hv_qdata = &hv_qdata_vec; }
 }
 
 void LagrangianHydroOperator::Mult(const Vector &S, Vector &dS_dt) const
@@ -409,6 +680,7 @@ void LagrangianHydroOperator::SolveVelocity(const Vector &S,
       dv = 0.0;
       return;
    }
+   ComputeHyperViscosity(S);
    UpdateQuadratureData(S);
    AssembleForceMatrix();
    // The monolithic BlockVector stores the unknown fields as follows:
@@ -1656,6 +1928,7 @@ void QUpdateBody(const int NE, const int e,
                  const int NQ, const int q,
                  const bool use_viscosity,
                  const bool use_vorticity,
+                 const bool use_hypervisc,
                  const double viscosity_const,
                  const double h0,
                  const double h1order,
@@ -1679,6 +1952,7 @@ void QUpdateBody(const int NE, const int e,
                  const double* __restrict__ d_e_quads,
                  const double* __restrict__ d_grad_v_ext,
                  const double* __restrict__ d_Jac0inv,
+                 const double* __restrict__ d_hv_coeff,
                  double *d_dt_est,
                  double *d_stressJinvT,
                  double *d_pressureJinvT,
@@ -1755,6 +2029,11 @@ void QUpdateBody(const int NE, const int e,
       const double eps = 1e-12;
       visc_coeff += 0.5 * R * H  * S * vorticity_coeff *
                     (1.0 - smooth_step_01(mu-2.0*eps, eps));
+      // Paper limiter: mu* = min(mu_hyp, mu_std).
+      if (use_hypervisc && d_hv_coeff)
+      {
+         visc_coeff = fmin(visc_coeff, d_hv_coeff[eq]);
+      }
       if (viscosity_const >= 0.0)
       {
          visc_coeff = viscosity_const;
@@ -1926,6 +2205,7 @@ template<int DIM, int Q1D> static inline
 void QKernel(const int NE, const int NQ,
              const bool use_viscosity,
              const bool use_vorticity,
+             const bool use_hypervisc,
              const double viscosity_const,
              const double h0,
              const double h1order,
@@ -1938,6 +2218,7 @@ void QKernel(const int NE, const int NQ,
              const Vector &e_quads,
              const Vector &grad_v_ext,
              const DenseTensor &Jac0inv,
+             const Vector *hv_qdata,
              Vector &dt_est,
              DenseTensor &stressJinvT,
              DenseTensor &pressureJinvT,
@@ -1951,6 +2232,8 @@ void QKernel(const int NE, const int NQ,
    const auto d_e_quads = e_quads.Read();
    const auto d_grad_v_ext = grad_v_ext.Read();
    const auto d_Jac0inv = Read(Jac0inv.GetMemory(), Jac0inv.TotalSize());
+   const double *d_hv_coeff = (use_hypervisc && hv_qdata) ?
+                               hv_qdata->Read() : nullptr;
    auto d_dt_est = dt_est.ReadWrite();
    auto d_stressJinvT = Write(stressJinvT.GetMemory(), stressJinvT.TotalSize());
    auto d_pressureJinvT = Write(pressureJinvT.GetMemory(), pressureJinvT.TotalSize());
@@ -1977,7 +2260,8 @@ void QKernel(const int NE, const int NQ,
             MFEM_FOREACH_THREAD(qy,y,Q1D)
             {
                QUpdateBody<DIM>(NE, e, NQ, qx + qy * Q1D,
-                                use_viscosity, use_vorticity, viscosity_const,
+                                use_viscosity, use_vorticity, use_hypervisc,
+                                viscosity_const,
                                 h0, h1order, cfl, infinity,
                                 Jinv, stress, sgrad_v, eig_val_data, eig_vec_data,
                                 compr_dir, Jpi, ph_dir,
@@ -1986,6 +2270,7 @@ void QKernel(const int NE, const int NQ,
                                 viscousJiT,
                                 d_gamma, d_weights, d_Jacobians, d_rho0DetJ0w,
                                 d_e_quads, d_grad_v_ext, d_Jac0inv,
+                                d_hv_coeff,
                                 d_dt_est, d_stressJinvT,
                                 d_pressureJinvT, d_viscousJinvT);
             }
@@ -2017,7 +2302,8 @@ void QKernel(const int NE, const int NQ,
                MFEM_FOREACH_THREAD(qz,z,Q1D)
                {
                   QUpdateBody<DIM>(NE, e, NQ, qx + Q1D * (qy + qz * Q1D),
-                                   use_viscosity, use_vorticity, viscosity_const,
+                                   use_viscosity, use_vorticity, use_hypervisc,
+                                   viscosity_const,
                                    h0, h1order, cfl, infinity,
                                    Jinv, stress, sgrad_v, eig_val_data, eig_vec_data,
                                    compr_dir, Jpi, ph_dir,
@@ -2026,6 +2312,7 @@ void QKernel(const int NE, const int NQ,
                                    viscousJiT,
                                    d_gamma, d_weights, d_Jacobians, d_rho0DetJ0w,
                                    d_e_quads, d_grad_v_ext, d_Jac0inv,
+                                   d_hv_coeff,
                                    d_dt_est, d_stressJinvT,
                                    d_pressureJinvT, d_viscousJinvT);
                }
@@ -2061,6 +2348,7 @@ void QUpdate::UpdateQuadratureData(const Vector &S, QuadratureData &qdata)
    typedef void (*fQKernel)(const int NE, const int NQ,
                             const bool use_viscosity,
                             const bool use_vorticity,
+                            const bool use_hypervisc,
                             const double viscosity_const,
                             const double h0, const double h1order,
                             const double cfl, const double infinity,
@@ -2069,7 +2357,8 @@ void QUpdate::UpdateQuadratureData(const Vector &S, QuadratureData &qdata)
                             const Vector &Jacobians, const Vector &rho0DetJ0w,
                             const Vector &e_quads, const Vector &grad_v_ext,
                             const DenseTensor &Jac0inv,
-                            Vector &dt_est, 
+                            const Vector *hv_qdata,
+                            Vector &dt_est,
                             DenseTensor &stressJinvT,
                             DenseTensor &pressureJinvT,
                             DenseTensor &viscousJinvT);
@@ -2087,11 +2376,12 @@ void QUpdate::UpdateQuadratureData(const Vector &S, QuadratureData &qdata)
       mfem::out << "Unknown kernel 0x" << std::hex << id << std::endl;
       MFEM_ABORT("Unknown kernel");
    }
-   qupdate[id](NE, NQ, use_viscosity, use_vorticity, viscosity_const,
+   qupdate[id](NE, NQ, use_viscosity, use_vorticity, use_hypervisc,
+               viscosity_const,
                qdata.h0, h1order,
                cfl, infinity, gamma_gf, ir.GetWeights(), q_dx,
                qdata.rho0DetJ0w, q_e, q_dv,
-               qdata.Jac0inv, q_dt_est,
+               qdata.Jac0inv, hv_qdata, q_dt_est,
                qdata.stressJinvT, qdata.pressureJinvT, qdata.viscousJinvT);
    qdata.dt_est = q_dt_est.Min();
    LAGHOS_DEVICE_SYNC;
