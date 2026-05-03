@@ -444,7 +444,9 @@ int main(int argc, char *argv[])
          S = S_old;
          hydro.ResetQuadratureData();
          cout << "Repeating step " << ti << endl;
-         if (steps < max_tsteps) { last_step = false; }
+         // A rejected step must always re-enter the time loop, even when the
+         // original candidate step had been clipped to t_final.
+         last_step = false;
          ti--; continue;
       }
       else if (dt_est > 1.25 * dt) { dt *= 1.02; }
