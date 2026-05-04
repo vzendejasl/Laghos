@@ -30,6 +30,8 @@ namespace mfem
 namespace hydrodynamics
 {
 
+MFEM_HOST_DEVICE inline double smooth_step_01(double x, double eps);
+
 // Sensor coefficient for hyperviscosity: g = h^2 * ||S(v)||_F.
 class StrainFrobeniusCoefficient : public Coefficient
 {
@@ -261,6 +263,8 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    rho0_coeff(rho0_coeff),
    gamma_gf(gamma_gf),
    hv_fec(nullptr), hv_fes(nullptr),
+   hv_qspace(nullptr), hv_sensor_qf(nullptr), hv_filtered_qf(nullptr),
+   hv_mu_qf(nullptr),
    hv_mass_form(nullptr), hv_stiff_form(nullptr),
    hv_M_inv(nullptr), hv_qi(nullptr),
    hv_er(nullptr),
@@ -297,8 +301,15 @@ LagrangianHydroOperator::LagrangianHydroOperator(const int size,
    solve_power_valid(false),
    rhs_c_gf(&H1c),
    dvc_gf(&H1c),
-   e_bdr_flux(nullptr)
+   e_bdr_flux(nullptr),
+   hv_negative_before_clip(0),
+   hv_negative_after_clip(0)
 {
+   MFEM_VERIFY(!use_hypervisc || p_assembly,
+               "Hyperviscosity currently requires -pa.");
+   MFEM_VERIFY(!(use_hypervisc && viscosity_const >= 0.0),
+               "Do not combine --hypervisc with -fv.");
+
    if (use_conduction)
    {
    }
@@ -488,6 +499,10 @@ if (Mpi::Root()) {
       const int h1_order = H1.GetOrder(0);
       hv_fec = new H1_FECollection(h1_order, dim);
       hv_fes = new ParFiniteElementSpace(pmesh, hv_fec);
+      hv_qspace = new QuadratureSpace(*pmesh, ir);
+      hv_sensor_qf = new QuadratureFunction(hv_qspace);
+      hv_filtered_qf = new QuadratureFunction(hv_qspace);
+      hv_mu_qf = new QuadratureFunction(hv_qspace);
 
       hv_mass_form = new ParBilinearForm(hv_fes);
       hv_stiff_form = new ParBilinearForm(hv_fes);
@@ -533,12 +548,6 @@ if (Mpi::Root()) {
       // Stiffness diagonal for Jacobi smoothing at the true-dof level.
       hv_K_handle.Ptr()->AssembleDiagonal(hv_Kdiag);
 
-      // Element size h^{2z} at scalar DOFs.
-      ElementSizePowerCoefficient hpow_coeff(pmesh, 2.0 * hv_z);
-      ParGridFunction hpow_gf(hv_fes);
-      hpow_gf.ProjectCoefficient(hpow_coeff);
-      hpow_gf.GetTrueDofs(hv_hpow);
-
       // Quadrature interpolator for sensor → quadrature points.
       hv_qi = hv_fes->GetQuadratureInterpolator(ir);
       hv_qdata_vec.SetSize(NE * ir.GetNPoints());
@@ -571,37 +580,111 @@ LagrangianHydroOperator::~LagrangianHydroOperator()
    delete hv_M_inv;
    delete hv_stiff_form;
    delete hv_mass_form;
+   delete hv_mu_qf;
+   delete hv_filtered_qf;
+   delete hv_sensor_qf;
+   delete hv_qspace;
    delete hv_fes;
    delete hv_fec;
    delete e_bdr_flux;
+}
+
+void LagrangianHydroOperator::ProjectQuadratureScalarToH1(
+   const QuadratureFunction &qf,
+   ParGridFunction &gf,
+   Vector &true_dofs) const
+{
+   QuadratureFunctionCoefficient qfc(qf);
+   ParLinearForm rhs_form(hv_fes);
+   rhs_form.AddDomainIntegrator(new QuadratureLFIntegrator(qfc));
+   rhs_form.Assemble();
+   rhs_form.ParallelAssemble(hv_rhs);
+   hv_M_inv->Mult(hv_rhs, true_dofs);
+   gf.SetFromTrueDofs(true_dofs);
 }
 
 void LagrangianHydroOperator::ComputeHyperViscosity(const Vector &S) const
 {
    if (!use_hypervisc) { return; }
 
-   // Extract velocity from state vector.
-   Vector* sptr = const_cast<Vector*>(&S);
-   ParGridFunction v_gf;
-   v_gf.MakeRef(&H1, *sptr, H1.GetVSize());
+   const int nqp = ir.GetNPoints();
+   const int dim2 = dim * dim;
+   const double inv_dim = 1.0 / static_cast<double>(dim);
+   const double sensor_scale = qdata.h0 * qdata.h0;
 
-   // Step 1: Compute sensor g = h^2 * ||S(v)||_F at scalar DOFs.
-   StrainFrobeniusCoefficient g_coeff(&v_gf, pmesh);
-   hv_sensor_gf.ProjectCoefficient(g_coeff);
+   Vector *sptr = const_cast<Vector*>(&S);
+   ParGridFunction x_gf_ref, v_gf_ref;
+   x_gf_ref.MakeRef(&H1, *sptr, 0);
+   v_gf_ref.MakeRef(&H1, *sptr, H1.GetVSize());
 
-   // Work on true-dof level for the Laplacian pipeline.
-   // Use FormLinearSystem/RecoverFEMSolution pattern for parallel correctness.
-   hv_sensor_gf.GetTrueDofs(hv_work);
+   const Operator *h1_er =
+      H1.GetElementRestriction(ElementDofOrdering::LEXICOGRAPHIC);
+   const QuadratureInterpolator *h1_qi = H1.GetQuadratureInterpolator(ir);
 
-   // Step 2: Apply the paper's primal-to-primal discrete Laplacian
-   // Delta_h = M^{-1} (S_bc - S) z times.
-   for (int k = 0; k < hv_z; k++)
+   h1_er->Mult(x_gf_ref, qupdate->e_vec);
+   h1_qi->SetOutputLayout(QVectorLayout::byVDIM);
+   h1_qi->Derivatives(qupdate->e_vec, qupdate->q_dx);
+
+   h1_er->Mult(v_gf_ref, qupdate->e_vec);
+   h1_qi->Derivatives(qupdate->e_vec, qupdate->q_dv);
+
+   hv_sensor_qf->HostWrite();
+   qupdate->q_dx.HostRead();
+   qupdate->q_dv.HostRead();
+   Vector jac0inv_vec(qdata.Jac0inv.Data(), qdata.Jac0inv.TotalSize());
+   jac0inv_vec.HostRead();
+
+   for (int e = 0; e < NE; ++e)
    {
-      // Interior contribution: -S x.
+      for (int q = 0; q < nqp; ++q)
+      {
+         const int eq = e * nqp + q;
+         DenseMatrix J(const_cast<double *>(qupdate->q_dx.HostRead() + eq * dim2),
+                       dim, dim);
+         DenseMatrix dV(const_cast<double *>(qupdate->q_dv.HostRead() + eq * dim2),
+                        dim, dim);
+         DenseMatrix J0inv(const_cast<double *>(jac0inv_vec.HostRead() + eq * dim2),
+                           dim, dim);
+
+         const double detJ = J.Det();
+         const double detJ0inv = J0inv.Det();
+         if (detJ <= 0.0 || detJ0inv <= 0.0)
+         {
+            (*hv_sensor_qf)(eq) = 0.0;
+            continue;
+         }
+
+         DenseMatrixInverse invJ(J);
+         DenseMatrix Jinv(dim), grad(dim);
+         invJ.GetInverseMatrix(Jinv);
+         mfem::Mult(dV, Jinv, grad);
+
+         double strain_sq = 0.0;
+         for (int i = 0; i < dim; ++i)
+         {
+            for (int j = 0; j < dim; ++j)
+            {
+               const double sij = 0.5 * (grad(i, j) + grad(j, i));
+               strain_sq += sij * sij;
+            }
+         }
+
+         const double detJ0 = 1.0 / detJ0inv;
+         const double ale_scale = pow(detJ / detJ0, 2.0 * inv_dim);
+         (*hv_sensor_qf)(eq) =
+            sensor_scale * ale_scale * sqrt(std::max(strain_sq, 0.0));
+      }
+   }
+
+   ProjectQuadratureScalarToH1(*hv_sensor_qf, hv_sensor_gf, hv_work);
+   hv_negative_before_clip = 0;
+   hv_negative_after_clip = 0;
+
+   for (int k = 0; k < hv_z; ++k)
+   {
       hv_K_handle.Ptr()->Mult(hv_work, hv_rhs);
       hv_rhs *= -1.0;
 
-      // Boundary contribution: +S_bc x.
       hv_sensor_gf.SetFromTrueDofs(hv_work);
       ParLinearForm b_form(hv_fes);
       b_form.AddBdrFaceIntegrator(
@@ -613,39 +696,74 @@ void LagrangianHydroOperator::ComputeHyperViscosity(const Vector &S) const
       hv_M_inv->Mult(hv_rhs, hv_work);
    }
 
-   // Step 3: Absolute value.
-   for (int i = 0; i < hv_work.Size(); i++)
+   for (int i = 0; i < hv_work.Size(); ++i)
    {
       hv_work(i) = fabs(hv_work(i));
    }
 
-   // Step 4: Weighted Jacobi smoothing on the true-dof operator.
-   for (int s = 0; s < hv_smooth_steps; s++)
+   for (int s = 0; s < hv_smooth_steps; ++s)
    {
       hv_K_handle.Ptr()->Mult(hv_work, hv_rhs);
-      for (int i = 0; i < hv_work.Size(); i++)
+      for (int i = 0; i < hv_work.Size(); ++i)
       {
          const double di = hv_Kdiag(i);
          if (di != 0.0)
          {
             hv_work(i) -= hv_smooth_omega * hv_rhs(i) / di;
          }
+         if (hv_work(i) < 0.0)
+         {
+            hv_negative_before_clip++;
+            hv_work(i) = 0.0;
+         }
       }
    }
 
-   // Step 5: Scale by c_h * h^{2z}.
-   for (int i = 0; i < hv_work.Size(); i++)
-   {
-      hv_work(i) = hv_coeff * hv_hpow(i) * hv_work(i);
-   }
-
-   // Step 6: Interpolate to quadrature points.
    hv_mu_gf.SetFromTrueDofs(hv_work);
    hv_er->Mult(hv_mu_gf, hv_evec);
    hv_qi->SetOutputLayout(QVectorLayout::byNODES);
    hv_qi->Values(hv_evec, hv_qdata_vec);
 
-   // Make available to QUpdate.
+   hv_filtered_qf->HostWrite();
+   hv_mu_qf->HostWrite();
+   hv_qdata_vec.HostReadWrite();
+   qdata.rho0DetJ0w.HostRead();
+   for (int e = 0; e < NE; ++e)
+   {
+      for (int q = 0; q < nqp; ++q)
+      {
+         const int eq = e * nqp + q;
+         DenseMatrix J(const_cast<double *>(qupdate->q_dx.HostRead() + eq * dim2),
+                       dim, dim);
+         DenseMatrix J0inv(const_cast<double *>(jac0inv_vec.HostRead() + eq * dim2),
+                           dim, dim);
+
+         const double detJ = J.Det();
+         const double detJ0inv = J0inv.Det();
+         const double raw_chi_q = hv_qdata_vec(eq);
+         if (raw_chi_q < 0.0) { hv_negative_after_clip++; }
+         const double chi_q = std::max(raw_chi_q, 0.0);
+         (*hv_filtered_qf)(eq) = chi_q;
+         double mu_hyp = 0.0;
+         if (detJ > 0.0 && detJ0inv > 0.0)
+         {
+            const double detJ0 = 1.0 / detJ0inv;
+            const double ell =
+               qdata.h0 * pow(detJ / detJ0, inv_dim);
+            const double rho_q =
+               qdata.rho0DetJ0w(eq) / (detJ * ir.IntPoint(q).weight);
+            mu_hyp = hv_coeff * rho_q * pow(ell, 2.0 * hv_z) * chi_q;
+         }
+         if (mu_hyp < 0.0) { mu_hyp = 0.0; }
+         hv_qdata_vec(eq) = mu_hyp;
+         (*hv_mu_qf)(eq) = mu_hyp;
+      }
+   }
+
+   ProjectQuadratureScalarToH1(*hv_mu_qf, hv_mu_gf, hv_tmp);
+
+   qdata_is_current = false;
+   forcemat_is_assembled = false;
    if (qupdate) { qupdate->hv_qdata = &hv_qdata_vec; }
 }
 
@@ -1069,9 +1187,178 @@ void LagrangianHydroOperator::ComputeConductionPostprocess(const Vector &S,
    cg.Mult(neg_k, de_cond);
 }
 
+double LagrangianHydroOperator::ComputeStandardViscosityAtQuad(int e, int q) const
+{
+   if (!use_viscosity) { return 0.0; }
+   if (viscosity_const >= 0.0) { return viscosity_const; }
+
+   const int nqp = ir.GetNPoints();
+   const int eq = e * nqp + q;
+   const int dim2 = dim * dim;
+
+   DenseMatrix J(const_cast<double *>(qupdate->q_dx.HostRead() + eq * dim2), dim, dim);
+   DenseMatrix dV(const_cast<double *>(qupdate->q_dv.HostRead() + eq * dim2), dim, dim);
+
+   const double detJ = J.Det();
+   if (detJ <= 0.0) { return 0.0; }
+
+   DenseMatrixInverse invJ(J);
+   DenseMatrix Jinv(dim), grad(dim), Jpi(dim);
+   invJ.GetInverseMatrix(Jinv);
+   mfem::Mult(dV, Jinv, grad);
+
+   double vorticity_coeff = 1.0;
+   if (use_vorticity)
+   {
+      const double grad_norm = grad.FNorm();
+      const double div_v = fabs(grad.Trace());
+      vorticity_coeff = (grad_norm > 0.0) ? div_v / grad_norm : 1.0;
+   }
+
+   DenseMatrix sgrad_v(grad);
+   sgrad_v.Symmetrize();
+
+   double eig_val_data[3] = {0.0, 0.0, 0.0};
+   double eig_vec_data[9] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+   if (dim == 1)
+   {
+      eig_val_data[0] = sgrad_v(0, 0);
+      eig_vec_data[0] = 1.0;
+   }
+   else
+   {
+      sgrad_v.CalcEigenvalues(eig_val_data, eig_vec_data);
+   }
+
+   Vector compr_dir(eig_vec_data, dim);
+   Vector ph_dir(dim);
+   mfem::Mult(J, qdata.Jac0inv(eq), Jpi);
+   Jpi.Mult(compr_dir, ph_dir);
+
+   const double h = qdata.h0 * ph_dir.Norml2() / compr_dir.Norml2();
+   const double mu = eig_val_data[0];
+   const double rho =
+      qdata.rho0DetJ0w(eq) / (detJ * ir.IntPoint(q).weight);
+   const double gamma = gamma_gf(e);
+   const double E = std::max(0.0, qupdate->q_e(eq));
+   const double sound_speed = sqrt(gamma * (gamma - 1.0) * E);
+
+   double visc_coeff = 2.0 * rho * h * h * fabs(mu);
+   const double eps = 1e-12;
+   visc_coeff += 0.5 * rho * h * sound_speed * vorticity_coeff *
+                 (1.0 - smooth_step_01(mu - 2.0 * eps, eps));
+   return visc_coeff;
+}
+
+void LagrangianHydroOperator::ComputeHyperviscDiagnostics(
+   const Vector &S,
+   HyperviscDiagnostics &diag) const
+{
+   diag = HyperviscDiagnostics{};
+   if (!use_hypervisc) { return; }
+
+   UpdateMesh(S);
+   ComputeHyperViscosity(S);
+   UpdateQuadratureData(S);
+
+   const int nqp = ir.GetNPoints();
+   const int nq_tot = NE * nqp;
+   hv_sensor_qf->HostRead();
+   hv_filtered_qf->HostRead();
+   hv_mu_qf->HostRead();
+   qupdate->q_dx.HostRead();
+   qupdate->q_dv.HostRead();
+   qupdate->q_e.HostRead();
+
+   auto reduce_stats = [&](const QuadratureFunction &qf,
+                           double &gmin, double &gmax, double &gmean)
+   {
+      double lmin = std::numeric_limits<double>::infinity();
+      double lmax = -std::numeric_limits<double>::infinity();
+      double lsum = 0.0;
+      long long lcount = 0;
+      for (int i = 0; i < nq_tot; ++i)
+      {
+         const double v = qf(i);
+         lmin = std::min(lmin, v);
+         lmax = std::max(lmax, v);
+         lsum += v;
+         lcount++;
+      }
+
+      double gsum = 0.0;
+      long long gcount = 0;
+      MPI_Allreduce(&lmin, &gmin, 1, MPI_DOUBLE, MPI_MIN, H1.GetComm());
+      MPI_Allreduce(&lmax, &gmax, 1, MPI_DOUBLE, MPI_MAX, H1.GetComm());
+      MPI_Allreduce(&lsum, &gsum, 1, MPI_DOUBLE, MPI_SUM, H1.GetComm());
+      MPI_Allreduce(&lcount, &gcount, 1, MPI_LONG_LONG, MPI_SUM, H1.GetComm());
+      gmean = (gcount > 0) ? (gsum / static_cast<double>(gcount)) : 0.0;
+   };
+
+   reduce_stats(*hv_sensor_qf, diag.sensor_min, diag.sensor_max, diag.sensor_mean);
+   reduce_stats(*hv_filtered_qf, diag.filtered_min, diag.filtered_max,
+                diag.filtered_mean);
+   reduce_stats(*hv_mu_qf, diag.mu_hyp_min, diag.mu_hyp_max, diag.mu_hyp_mean);
+
+   double mu_std_min = std::numeric_limits<double>::infinity();
+   double mu_std_max = -std::numeric_limits<double>::infinity();
+   double mu_std_sum = 0.0;
+   double mu_star_min = std::numeric_limits<double>::infinity();
+   double mu_star_max = -std::numeric_limits<double>::infinity();
+   double mu_star_sum = 0.0;
+   long long limited_local = 0;
+   long long count_local = 0;
+   for (int e = 0; e < NE; ++e)
+   {
+      for (int q = 0; q < nqp; ++q)
+      {
+         const int eq = e * nqp + q;
+         const double mu_std = ComputeStandardViscosityAtQuad(e, q);
+         const double mu_hyp = (*hv_mu_qf)(eq);
+         const double mu_star = std::min(mu_std, mu_hyp);
+         mu_std_min = std::min(mu_std_min, mu_std);
+         mu_std_max = std::max(mu_std_max, mu_std);
+         mu_std_sum += mu_std;
+         mu_star_min = std::min(mu_star_min, mu_star);
+         mu_star_max = std::max(mu_star_max, mu_star);
+         mu_star_sum += mu_star;
+         limited_local += (mu_hyp < mu_std) ? 1 : 0;
+         count_local++;
+      }
+   }
+
+   double mu_std_sum_g = 0.0, mu_star_sum_g = 0.0;
+   long long limited_global = 0, count_global = 0;
+   MPI_Allreduce(&mu_std_min, &diag.mu_std_min, 1, MPI_DOUBLE, MPI_MIN, H1.GetComm());
+   MPI_Allreduce(&mu_std_max, &diag.mu_std_max, 1, MPI_DOUBLE, MPI_MAX, H1.GetComm());
+   MPI_Allreduce(&mu_std_sum, &mu_std_sum_g, 1, MPI_DOUBLE, MPI_SUM, H1.GetComm());
+   MPI_Allreduce(&mu_star_min, &diag.mu_star_min, 1, MPI_DOUBLE, MPI_MIN, H1.GetComm());
+   MPI_Allreduce(&mu_star_max, &diag.mu_star_max, 1, MPI_DOUBLE, MPI_MAX, H1.GetComm());
+   MPI_Allreduce(&mu_star_sum, &mu_star_sum_g, 1, MPI_DOUBLE, MPI_SUM, H1.GetComm());
+   MPI_Allreduce(&limited_local, &limited_global, 1, MPI_LONG_LONG, MPI_SUM, H1.GetComm());
+   MPI_Allreduce(&count_local, &count_global, 1, MPI_LONG_LONG, MPI_SUM, H1.GetComm());
+
+   if (count_global > 0)
+   {
+      diag.mu_std_mean = mu_std_sum_g / static_cast<double>(count_global);
+      diag.mu_star_mean = mu_star_sum_g / static_cast<double>(count_global);
+      diag.fraction_limited =
+         static_cast<double>(limited_global) / static_cast<double>(count_global);
+   }
+
+   long long neg_before = hv_negative_before_clip;
+   long long neg_after = hv_negative_after_clip;
+   long long neg_before_g = 0, neg_after_g = 0;
+   MPI_Allreduce(&neg_before, &neg_before_g, 1, MPI_LONG_LONG, MPI_SUM, H1.GetComm());
+   MPI_Allreduce(&neg_after, &neg_after_g, 1, MPI_LONG_LONG, MPI_SUM, H1.GetComm());
+   diag.negative_before_clip = neg_before_g;
+   diag.negative_after_clip = neg_after_g;
+}
+
 double LagrangianHydroOperator::GetTimeStepEstimate(const Vector &S) const
 {
    UpdateMesh(S);
+   if (use_hypervisc) { ComputeHyperViscosity(S); }
    UpdateQuadratureData(S);
    double glob_dt_est;
    const MPI_Comm comm = H1.GetParMesh()->GetComm();
@@ -1102,6 +1389,8 @@ double LagrangianHydroOperator::GetTimeStepEstimate(const Vector &S) const
 void LagrangianHydroOperator::ResetTimeStepEstimate() const
 {
    qdata.dt_est = std::numeric_limits<double>::infinity();
+   qdata_is_current = false;
+   forcemat_is_assembled = false;
 }
 
 void LagrangianHydroOperator::ComputeDensity(ParGridFunction &rho) const
@@ -2029,10 +2318,11 @@ void QUpdateBody(const int NE, const int e,
       const double eps = 1e-12;
       visc_coeff += 0.5 * R * H  * S * vorticity_coeff *
                     (1.0 - smooth_step_01(mu-2.0*eps, eps));
-      // Paper limiter: mu* = min(mu_hyp, mu_std).
+      // Paper limiter: mu* = min(mu_std, mu_hyp), with mu_hyp already
+      // carrying the rho * ell^(2z) scaling from the hyperviscosity pipeline.
       if (use_hypervisc && d_hv_coeff)
       {
-         visc_coeff = fmin(visc_coeff, d_hv_coeff[eq]);
+         visc_coeff = fmin(visc_coeff, fmax(d_hv_coeff[eq], 0.0));
       }
       if (viscosity_const >= 0.0)
       {

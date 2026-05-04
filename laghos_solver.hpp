@@ -55,6 +55,18 @@ struct TimingData
       L2dof(l2d), H1iter(0), L2iter(0), quad_tstep(0) { }
 };
 
+struct HyperviscDiagnostics
+{
+   double sensor_min = 0.0, sensor_max = 0.0, sensor_mean = 0.0;
+   double filtered_min = 0.0, filtered_max = 0.0, filtered_mean = 0.0;
+   double mu_std_min = 0.0, mu_std_max = 0.0, mu_std_mean = 0.0;
+   double mu_hyp_min = 0.0, mu_hyp_max = 0.0, mu_hyp_mean = 0.0;
+   double mu_star_min = 0.0, mu_star_max = 0.0, mu_star_mean = 0.0;
+   double fraction_limited = 0.0;
+   HYPRE_BigInt negative_before_clip = 0;
+   HYPRE_BigInt negative_after_clip = 0;
+};
+
 class QUpdate
 {
 private:
@@ -146,6 +158,10 @@ protected:
    // Hyperviscosity scalar FE machinery.
    H1_FECollection *hv_fec;
    ParFiniteElementSpace *hv_fes;
+   QuadratureSpace *hv_qspace;
+   QuadratureFunction *hv_sensor_qf;
+   QuadratureFunction *hv_filtered_qf;
+   QuadratureFunction *hv_mu_qf;
    ParBilinearForm *hv_mass_form;
    ParBilinearForm *hv_stiff_form;
    CGSolver *hv_M_inv;
@@ -155,6 +171,8 @@ protected:
    mutable Vector hv_qdata_vec;
    mutable ParGridFunction hv_sensor_gf, hv_mu_gf;
    const QuadratureInterpolator *hv_qi;
+   mutable HYPRE_BigInt hv_negative_before_clip;
+   mutable HYPRE_BigInt hv_negative_after_clip;
 
    // DG Conduction operator post-processing (standalone function call)
    mutable ParLinearForm *e_bdr_flux;
@@ -213,6 +231,10 @@ protected:
    void UpdateQuadratureData(const Vector &S) const;
    void AssembleForceMatrix() const;
    void ComputeHyperViscosity(const Vector &S) const;
+   void ProjectQuadratureScalarToH1(const QuadratureFunction &qf,
+                                    ParGridFunction &gf,
+                                    Vector &true_dofs) const;
+   double ComputeStandardViscosityAtQuad(int e, int q) const;
    void ComputeConductionPostprocess(const Vector &S, Vector &de_cond,
                                      Vector *cond_rhs = nullptr) const;
 
@@ -255,7 +277,11 @@ public:
    // Calls UpdateQuadratureData to compute the new qdata.dt_estimate.
    double GetTimeStepEstimate(const Vector &S) const;
    void ResetTimeStepEstimate() const;
-   void ResetQuadratureData() const { qdata_is_current = false; }
+   void ResetQuadratureData() const
+   {
+      qdata_is_current = false;
+      forcemat_is_assembled = false;
+   }
 
    // L2 diagnostics from quadrature data (PA, final time)
    void ComputeL2Diagnostics(const Vector &S,
@@ -293,6 +319,9 @@ public:
 
    ParGridFunction *GetHyperviscSensorField() const
    { return use_hypervisc ? &hv_sensor_gf : nullptr; }
+
+   void ComputeHyperviscDiagnostics(const Vector &S,
+                                    HyperviscDiagnostics &diag) const;
 
    void ComputeConductionDiagnostics(const Vector &S, double &h_con, double &h_con_rms, ParGridFunction *work_cond = nullptr) const;
    void ComputeConductionDiagnosticsPA(const Vector &S, double &h_con, double &h_con_rms, ParGridFunction *work_cond = nullptr) const;

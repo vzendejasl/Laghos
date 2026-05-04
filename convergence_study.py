@@ -1,140 +1,155 @@
-# Usage:
-# To run the full convergence study:
-# python3 convergence_study.py
-#
-# To run a single refinement point (e.g., ok=4, ot=3, rp=3):
-# python3 convergence_study.py --ok 4 --ot 3 --rp 3
+#!/usr/bin/env python3
 
-import numpy as np
-import subprocess
-import csv
-import os
 import argparse
+import csv
+import math
+import os
+import re
+import subprocess
+import sys
 
-def run_laghos(rp, ok, ot):
+
+VEL_L2_RE = re.compile(r"L_2\s+error:\s*([0-9.eE+-]+)")
+RHO_L2_RE = re.compile(r"rho L_2 error:\s*([0-9.eE+-]+)")
+ZONES_RE = re.compile(r"Number of zones in the serial mesh:\s*(\d+)")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run the Laghos p=9 manufactured TGV convergence study."
+    )
+    parser.add_argument("--laghos", default="./laghos")
+    parser.add_argument("--mpirun", default="mpirun")
+    parser.add_argument("--np", type=int, default=8)
+    parser.add_argument("--orders", type=int, nargs="+", default=[2, 3, 4])
+    parser.add_argument("--refinements", type=int, nargs="+", default=[1, 2, 3, 4])
+    parser.add_argument("--tf", type=float, default=0.5)
+    parser.add_argument("--ode-solver", type=int, default=4)
+    parser.add_argument("--cg-tol", type=float, default=1e-10)
+    parser.add_argument("--hypervisc", action="store_true")
+    parser.add_argument("--hv-coeff", type=float, default=0.25)
+    parser.add_argument("--hv-z", type=int, default=1)
+    parser.add_argument("--hv-smooth-steps", type=int, default=5)
+    parser.add_argument("--hv-smooth-omega", type=float, default=2.0 / 3.0)
+    parser.add_argument("--csv", default="convergence_results.csv")
+    parser.add_argument("--log-dir", default="convergence_logs")
+    return parser.parse_args()
+
+
+def last_float(text, regex):
+    matches = regex.findall(text)
+    return float(matches[-1]) if matches else float("nan")
+
+
+def run_case(args, order, rs):
+    ot = order - 1
+    mode = "hv" if args.hypervisc else "stdav"
+    log_path = os.path.join(args.log_dir, f"{mode}_q{order}_rs{rs}_np{args.np}.log")
+
     cmd = [
-        "mpirun", "-np", "8", "./laghos",
-        "-p", "0", "-dim", "3", "-rs", "1", "-rp", str(rp),
-        "-ok", str(ok), "-ot", str(ot),
-        "-s", "2", "-tf", ".1", "-fv", "-Re", "400",
-        "-cond", "-pr", "0.71", "-ms", "1",
-        "-iv", "-diag", "output.txt", "-mach", "0.28",
-        "-u0", "1.0", "-cfl", "0.2"
+        args.mpirun, "-np", str(args.np), args.laghos,
+        "-p", "9",
+        "-dim", "2",
+        "-rs", str(rs),
+        "-ok", str(order),
+        "-ot", str(ot),
+        "-tf", str(args.tf),
+        "-s", str(args.ode_solver),
+        "-pa",
+        "-iv",
+        "-cgt", str(args.cg_tol),
+        "-no-cond",
+        "-no-vis",
+        "-no-visit",
+        "-no-print",
     ]
-    print(f"Executing: {' '.join(cmd)}")
-    # Use subprocess.Popen to stream output in real-time
-    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
-        for line in proc.stdout:
-            print(line, end='')
-    if proc.returncode != 0:
-        print(f"Error: Laghos exited with code {proc.returncode}")
 
-def get_rms_heat():
-    if not os.path.exists("laghos_thermo.csv"):
-        return None
-    with open("laghos_thermo.csv", "r") as f:
-        reader = csv.reader(f)
-        lines = list(reader)
-        if len(lines) < 2: return None
-        try:
-            return float(lines[-1][6].strip())
-        except: return None
+    if args.hypervisc:
+        cmd += [
+            "--hypervisc",
+            "--hv-coeff", str(args.hv_coeff),
+            "--hv-z", str(args.hv_z),
+            "--hv-smooth-steps", str(args.hv_smooth_steps),
+            "--hv-smooth-omega", str(args.hv_smooth_omega),
+        ]
 
-# Constants for Analytical Solution
-rho0 = 1.0
-u0 = 1.0
-gamma = 5.0/3.0
-Pr = 0.71
-Re = 400.0
-mu = 1.0 / (Re * 2.0 * np.pi)
-kappa_e = mu * gamma / Pr
-rms_analytic = (kappa_e / (rho0**2 * (gamma - 1.0))) * np.pi**2 * rho0 * u0**2 * np.sqrt(6.0)
+    print("Running:", " ".join(cmd), flush=True)
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=os.getcwd(),
+    )
+
+    with open(log_path, "w", encoding="utf-8") as handle:
+        handle.write(proc.stdout)
+
+    zones_match = ZONES_RE.search(proc.stdout)
+    zones = int(zones_match.group(1)) if zones_match else -1
+    h = 1.0 / math.sqrt(zones) if zones > 0 else float("nan")
+
+    return {
+        "mode": mode,
+        "order": order,
+        "order_thermo": ot,
+        "refinement": rs,
+        "np": args.np,
+        "zones": zones,
+        "h": h,
+        "vel_l2_error": last_float(proc.stdout, VEL_L2_RE),
+        "rho_l2_error": last_float(proc.stdout, RHO_L2_RE),
+        "status": "ok" if proc.returncode == 0 else "failed",
+        "log_file": log_path,
+    }
+
+
+def rate(prev_err, curr_err):
+    if prev_err <= 0.0 or curr_err <= 0.0:
+        return float("nan")
+    return math.log(prev_err / curr_err, 2.0)
+
 
 def main():
-    parser = argparse.ArgumentParser(description='Run Laghos convergence study.')
-    parser.add_argument('--ok', type=int, help='Kinematic order')
-    parser.add_argument('--ot', type=int, help='Thermodynamic order')
-    parser.add_argument('--rp', type=int, help='Refinement level')
-    args = parser.parse_args()
+    args = parse_args()
+    os.makedirs(args.log_dir, exist_ok=True)
 
-    results_file = "convergence_results.txt"
+    rows = []
+    for order in args.orders:
+        for rs in args.refinements:
+            rows.append(run_case(args, order, rs))
 
-    if args.ok is not None and args.ot is not None and args.rp is not None:
-        # Run a single refinement point
-        if os.path.exists("laghos_thermo.csv"): os.remove("laghos_thermo.csv")
-        run_laghos(args.rp, args.ok, args.ot)
-        rms = get_rms_heat()
-        if rms is None:
-            print(f"FAILED: ok={args.ok}, ot={args.ot}, rp={args.rp}")
-            return
-        
-        h = 1.0 / (2**(1 + args.rp))
-        err = abs(rms - rms_analytic)
-        
-        line = f"ok={args.ok}, ot={args.ot}, rp={args.rp}, h={h:.4e}, RMS={rms:.8e}, Error={err:.8e}"
-        print(line)
-        with open(results_file, "a") as f:
-            f.write(line + "\n")
-    else:
-        # Full study loop
-        orders = [(2, 1), (3, 2), (4, 3)]
-        refinements = range(5)
+    rows.sort(key=lambda row: (row["order"], row["refinement"]))
+    previous = {}
+    for row in rows:
+        prev = previous.get(row["order"])
+        if prev is None:
+            row["vel_l2_rate"] = float("nan")
+            row["rho_l2_rate"] = float("nan")
+        else:
+            row["vel_l2_rate"] = rate(prev["vel_l2_error"], row["vel_l2_error"])
+            row["rho_l2_rate"] = rate(prev["rho_l2_error"], row["rho_l2_error"])
+        previous[row["order"]] = row
 
-        with open(results_file, "w") as f:
-            f.write(f"Analytical RMS: {rms_analytic:.8e}\n\n")
+    fieldnames = [
+        "mode", "order", "order_thermo", "refinement", "np", "zones", "h",
+        "vel_l2_error", "vel_l2_rate", "rho_l2_error", "rho_l2_rate",
+        "status", "log_file",
+    ]
 
-        print(f"Analytical RMS: {rms_analytic:.8e}\n")
+    with open(args.csv, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
-        for ok, ot in orders:
-            header = f"--- Study for Order (ok={ok}, ot={ot}) ---"
-            table_header = f"{'rp':<5} | {'h':<10} | {'RMS':<15} | {'Error':<15} | {'Rate':<10}"
-            separator = "-" * 65
-            
-            print(header)
-            print(table_header)
-            print(separator)
-            
-            with open(results_file, "a") as f:
-                f.write(header + "\n")
-                f.write(table_header + "\n")
-                f.write(separator + "\n")
+    print(f"Wrote {args.csv}")
+    for row in rows:
+        print(
+            f"{row['mode']} Q{row['order']} rs={row['refinement']} "
+            f"vel_L2={row['vel_l2_error']:.6e} rho_L2={row['rho_l2_error']:.6e} "
+            f"status={row['status']}"
+        )
 
-            errors = []
-            
-            # Limit refinement level for 4th order (ok=4) to 4 (rp=0, 1, 2, 3)
-            current_refinements = refinements
-            if ok == 4:
-                current_refinements = range(4)
-
-            for rp in current_refinements:
-                if os.path.exists("laghos_thermo.csv"): os.remove("laghos_thermo.csv")
-                run_laghos(rp, ok, ot)
-                rms = get_rms_heat()
-                
-                if rms is None:
-                    line = f"{rp:<5} | FAILED"
-                    print(line)
-                    with open(results_file, "a") as f:
-                        f.write(line + "\n")
-                    continue
-
-                h = 1.0 / (2**(1 + rp))
-                err = abs(rms - rms_analytic)
-                
-                rate_str = "---"
-                if len(errors) > 0:
-                    rate = np.log2(errors[-1] / err)
-                    rate_str = f"{rate:.2f}"
-                    
-                line = f"{rp:<5} | {h:<10.4e} | {rms:<15.8e} | {err:<15.8e} | {rate_str:<10}"
-                print(line)
-                with open(results_file, "a") as f:
-                    f.write(line + "\n")
-                
-                errors.append(err)
-            print()
-            with open(results_file, "a") as f:
-                f.write("\n")
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

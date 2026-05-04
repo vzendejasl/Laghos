@@ -1028,7 +1028,7 @@ int main(int argc, char *argv[])
                   "Reynolds number for fixed viscosity (L=1/(2*pi)).");
    args.AddOption(&use_hypervisc, "-hypervisc", "--hypervisc", "-no-hypervisc",
                   "--no-hypervisc",
-                  "Enable explicit hyperviscosity (replaces standard AV).");
+                  "Enable hyperviscosity limiter: mu = min(mu_std, mu_hyp).");
    args.AddOption(&hv_coeff, "-hv-coeff", "--hv-coeff",
                   "Hyperviscosity coefficient c_h.");
    args.AddOption(&hv_z, "-hv-z", "--hv-z",
@@ -1743,6 +1743,11 @@ int main(int argc, char *argv[])
                   "Heat conduction currently requires fixed viscosity (-fv).");
    }
 
+   MFEM_VERIFY(!use_hypervisc || p_assembly,
+               "Hyperviscosity currently requires -pa.");
+   MFEM_VERIFY(!(use_hypervisc && fixed_viscosity),
+               "Do not combine --hypervisc with -fv for the paper AV convergence test.");
+
    const bool freeze_momentum = (problem == 8);
    const bool enable_split_diagnostics = visit ||
                                          (diag_file && diag_file[0] != '\0');
@@ -1942,7 +1947,14 @@ int main(int argc, char *argv[])
                << "       viscous_power,  solve_total_power,"
                << " solve_pressure_power,  solve_viscous_power,"
                << " solve_conduction_power,          mach_min,"
-               << "             mach_max" << std::endl;
+               << "             mach_max,"
+               << "         hv_g_min,         hv_g_max,        hv_g_mean,"
+               << "       hv_chi_min,       hv_chi_max,      hv_chi_mean,"
+               << "    hv_mu_std_min,    hv_mu_std_max,   hv_mu_std_mean,"
+               << "    hv_mu_hyp_min,    hv_mu_hyp_max,   hv_mu_hyp_mean,"
+               << "   hv_mu_star_min,   hv_mu_star_max,  hv_mu_star_mean,"
+               << "  hv_fraction_limited, hv_neg_before_clip, hv_neg_after_clip"
+               << std::endl;
    }
    ConstantCoefficient zero_coeff(0.0);
    const double mass0 = diag_output ? rho0_gf.ComputeL1Error(zero_coeff) : 0.0;
@@ -1982,12 +1994,14 @@ int main(int argc, char *argv[])
       double r_rms_m0, t_rms_m0, d_rms_m0, c_rms_m0;
       double mach_avg0, mach_rms0, mach_max0, mach_avg_mw0, mach_rms_mw0;
       double mach_min0;
+      hydrodynamics::HyperviscDiagnostics hv_diag0;
       hydro->ComputeL2Diagnostics(S, vol0, r_avg0, t_avg0,
                                   r_rms0, t_rms0, d_rms0, c_rms0,
                                   r_rms_m0, t_rms_m0, d_rms_m0, c_rms_m0,
                                   mach_avg0, mach_rms0, mach_max0,
                                   mach_avg_mw0, mach_rms_mw0,
                                   mach_min0);
+      if (use_hypervisc) { hydro->ComputeHyperviscDiagnostics(S, hv_diag0); }
       if (Mpi::Root())
       {
          const double solve_total_power0 = 0.0;
@@ -2010,7 +2024,26 @@ int main(int argc, char *argv[])
                   << solve_viscous_power0 << ","
                   << solve_conduction_power0 << ","
                   << mach_min0 << ","
-                  << mach_max0 << std::endl;
+                  << mach_max0 << ","
+                  << hv_diag0.sensor_min << ","
+                  << hv_diag0.sensor_max << ","
+                  << hv_diag0.sensor_mean << ","
+                  << hv_diag0.filtered_min << ","
+                  << hv_diag0.filtered_max << ","
+                  << hv_diag0.filtered_mean << ","
+                  << hv_diag0.mu_std_min << ","
+                  << hv_diag0.mu_std_max << ","
+                  << hv_diag0.mu_std_mean << ","
+                  << hv_diag0.mu_hyp_min << ","
+                  << hv_diag0.mu_hyp_max << ","
+                  << hv_diag0.mu_hyp_mean << ","
+                  << hv_diag0.mu_star_min << ","
+                  << hv_diag0.mu_star_max << ","
+                  << hv_diag0.mu_star_mean << ","
+                  << hv_diag0.fraction_limited << ","
+                  << static_cast<double>(hv_diag0.negative_before_clip) << ","
+                  << static_cast<double>(hv_diag0.negative_after_clip)
+                  << std::endl;
       }
    }
 
@@ -2271,6 +2304,7 @@ int main(int argc, char *argv[])
       double e_integral = 0.0;
       double mach_min = 0.0;
       double mach_max = 0.0;
+      hydrodynamics::HyperviscDiagnostics hv_diag;
       if (log_step)
       {
          double lnorm = e_gf * e_gf, norm;
@@ -2297,6 +2331,10 @@ int main(int argc, char *argv[])
                Diagnostics::ComputeConductionSurfaceFlux(e_h1, kappa_e);
          }
          if (diag_output) { enstrophy = ComputeEnstrophy(v_gf); }
+         if (diag_output && use_hypervisc)
+         {
+            hydro->ComputeHyperviscDiagnostics(S, hv_diag);
+         }
          if (track_e_integral)
          {
             const double loc_integral = e_int_lf(e_gf);
@@ -2476,7 +2514,26 @@ int main(int argc, char *argv[])
                      << solve_viscous_power << ","
                      << solve_conduction_power << ","
                      << mach_min << ","
-                     << mach_max << std::endl;
+                     << mach_max << ","
+                     << hv_diag.sensor_min << ","
+                     << hv_diag.sensor_max << ","
+                     << hv_diag.sensor_mean << ","
+                     << hv_diag.filtered_min << ","
+                     << hv_diag.filtered_max << ","
+                     << hv_diag.filtered_mean << ","
+                     << hv_diag.mu_std_min << ","
+                     << hv_diag.mu_std_max << ","
+                     << hv_diag.mu_std_mean << ","
+                     << hv_diag.mu_hyp_min << ","
+                     << hv_diag.mu_hyp_max << ","
+                     << hv_diag.mu_hyp_mean << ","
+                     << hv_diag.mu_star_min << ","
+                     << hv_diag.mu_star_max << ","
+                     << hv_diag.mu_star_mean << ","
+                     << hv_diag.fraction_limited << ","
+                     << static_cast<double>(hv_diag.negative_before_clip) << ","
+                     << static_cast<double>(hv_diag.negative_after_clip)
+                     << std::endl;
          }
       }
 
