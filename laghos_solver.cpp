@@ -2318,11 +2318,12 @@ void QUpdateBody(const int NE, const int e,
       const double eps = 1e-12;
       visc_coeff += 0.5 * R * H  * S * vorticity_coeff *
                     (1.0 - smooth_step_01(mu-2.0*eps, eps));
-      // Paper limiter: mu* = min(mu_std, mu_hyp), with mu_hyp already
-      // carrying the rho * ell^(2z) scaling from the hyperviscosity pipeline.
+      // Experimental path: bypass the standard AV limiter and use the
+      // hyperviscosity coefficient directly.
       if (use_hypervisc && d_hv_coeff)
       {
-         visc_coeff = fmin(visc_coeff, fmax(d_hv_coeff[eq], 0.0));
+         // visc_coeff = fmin(visc_coeff, fmax(d_hv_coeff[eq], 0.0));
+         visc_coeff = fmax(d_hv_coeff[eq], 0.0);
       }
       if (viscosity_const >= 0.0)
       {

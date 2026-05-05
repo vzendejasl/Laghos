@@ -9,8 +9,8 @@ import subprocess
 import sys
 
 
-VEL_L2_RE = re.compile(r"L_2\s+error:\s*([0-9.eE+-]+)")
-RHO_L2_RE = re.compile(r"rho L_2 error:\s*([0-9.eE+-]+)")
+VEL_L2_RE = re.compile(r"^L_2\s+error:\s*([0-9.eE+-]+)", re.MULTILINE)
+RHO_L2_RE = re.compile(r"^rho L_2 error:\s*([0-9.eE+-]+)", re.MULTILINE)
 ZONES_RE = re.compile(r"Number of zones in the serial mesh:\s*(\d+)")
 
 
@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument("--orders", type=int, nargs="+", default=[2, 3, 4])
     parser.add_argument("--refinements", type=int, nargs="+", default=[1, 2, 3, 4])
     parser.add_argument("--tf", type=float, default=0.5)
+    parser.add_argument("--dt", type=float, default=-1.0)
     parser.add_argument("--ode-solver", type=int, default=4)
     parser.add_argument("--cg-tol", type=float, default=1e-10)
     parser.add_argument("--hypervisc", action="store_true")
@@ -63,6 +64,9 @@ def run_case(args, order, rs):
         "-no-visit",
         "-no-print",
     ]
+
+    if args.dt > 0.0:
+        cmd += ["-dt", str(args.dt)]
 
     if args.hypervisc:
         cmd += [
